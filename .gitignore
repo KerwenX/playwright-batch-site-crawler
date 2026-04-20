@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+
+.playwright-mcp/
+
+crawl_output*/
+
+*.log
+*.tmp
+.DS_Store
+
+CLAUDE.md
