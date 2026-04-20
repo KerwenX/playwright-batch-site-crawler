@@ -18,12 +18,20 @@
 - `*.ajcass.com` 家族：Hash 路由、SPA、接口驱动列表、动态点击展开
 - `*.cbpt.cnki.net` 家族：CNKI/CBPT 传统期刊站
 
+`*.cbpt.cnki.net` 当前会额外处理这些场景：
+
+- `wkTextContent.aspx` 的目录页、年卷页、期次页、栏目索引页
+- `wkList.aspx` 的列表页和导航页
+- 编辑后台、验证码页、下载接口会记录，但默认不继续访问
+- `paperDigest.aspx`、`wkTextContent.aspx?contentID=...` 这类正文叶子页默认只记录 URL，不逐个打开
+
 已验证示例：
 
 - `https://zgncjj.ajcass.com/#/`
 - `https://erj.ajcass.com/#/index`
 - `https://jjgl.ajcass.com/`
 - `https://zgfx.cbpt.cnki.net/`
+- `https://ddjy.cbpt.cnki.net/`
 
 ## 环境要求
 
@@ -129,6 +137,7 @@ https://zgfx.cbpt.cnki.net/
 - 程序中断后再次运行，会从检查点继续
 - 已访问 URL 不会重复抓取
 - 已完成站点不会重复跑
+- 如果升级了站点规则，程序会在恢复检查点时重新评估已发现 URL，并把现在应继续访问但过去被错误跳过的 URL 重新入队
 - 如果设置了 `max_pages_per_site`，达到上限时会保持 `completed = false`
 
 ## 输出结构

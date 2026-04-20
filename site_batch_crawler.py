@@ -311,6 +311,15 @@ def truncate_text(value: str, limit: int = 120) -> str:
     return text[: limit - 3] + "..."
 
 
+def cbpt_query_params(url: str) -> dict[str, str]:
+    parts = urlsplit(url)
+    return {
+        key: value
+        for key, value in parse_qsl(parts.query, keep_blank_values=True)
+        if value != ""
+    }
+
+
 def sort_query(query: str) -> str:
     params = [
         (key, value)
@@ -535,6 +544,7 @@ class SiteCrawler:
         self.ajcass_known_routes = set(payload.get("ajcass_known_routes", self.ajcass_known_routes))
         self.ajcass_issue_route = str(payload.get("ajcass_issue_route", self.ajcass_issue_route))
         self.completed = bool(payload.get("completed", False))
+        self._refresh_discovered_node_metadata()
         self.frontier = [
             item
             for item in self.frontier
@@ -547,6 +557,9 @@ class SiteCrawler:
                 filtered_count,
                 len(self.frontier),
             )
+        requeued_count = self._requeue_discovered_urls_if_needed()
+        if requeued_count > 0:
+            self.logger.info("Requeued discovered URLs after checkpoint restore count=%s frontier=%s", requeued_count, len(self.frontier))
 
     def _initialize_from_seed_urls(self, seed_urls: list[str]) -> None:
         for seed_url in seed_urls:
@@ -560,6 +573,37 @@ class SiteCrawler:
         added = len(self.frontier) - before_frontier
         if added > 0:
             self.logger.info("Merged seed URLs added_to_frontier=%s", added)
+
+    def _refresh_discovered_node_metadata(self) -> None:
+        for url, node in self.discovered_urls.items():
+            same_site = self.is_same_site(url)
+            queueable = self.is_queueable(url)
+            node["same_site"] = same_site
+            node["queueable"] = queueable
+            node["page_kind"] = self.page_kind(url) if queueable else "resource"
+
+    def _requeue_discovered_urls_if_needed(self) -> int:
+        existing_frontier_urls = {item.url for item in self.frontier}
+        requeued = 0
+        for url, node in self.discovered_urls.items():
+            if not node.get("queueable"):
+                continue
+            if not self.should_visit_url(url):
+                continue
+            if url in self.visited_urls or url in self.queued_urls or url in existing_frontier_urls:
+                continue
+            self.frontier.append(
+                QueueItem(
+                    url=url,
+                    depth=int(node.get("first_depth", 0)),
+                    discovered_from=str(node.get("first_source", url)),
+                    discovery_method=str(node.get("first_method", "resume")),
+                )
+            )
+            self.queued_urls.add(url)
+            existing_frontier_urls.add(url)
+            requeued += 1
+        return requeued
 
     def normalize_url(self, raw_url: str, base_url: str | None = None) -> str | None:
         if not raw_url:
@@ -666,10 +710,22 @@ class SiteCrawler:
                 return f"spa:{route[1:]}"
         if self.site_family == "cbpt_cnki" and parts.hostname == self.site_host:
             lowered_path = parts.path.lower()
-            if lowered_path.endswith("/wktextcontent.aspx") or lowered_path.endswith("/paperdigest.aspx"):
+            params = cbpt_query_params(normalized)
+            if lowered_path == "/index.aspx" and params.get("t"):
+                return "cbpt_aux"
+            if lowered_path.endswith("/showvalidatecode.aspx") or lowered_path.endswith("/validatecode.aspx") or lowered_path.endswith("/error.aspx") or lowered_path.endswith("/quit.aspx"):
+                return "cbpt_guard"
+            if "/editor" in lowered_path:
+                return "cbpt_aux"
+            if lowered_path.endswith("/paperdigest.aspx"):
                 return "cbpt_article"
+            if lowered_path.endswith("/wktextcontent.aspx"):
+                if params.get("contentID") or params.get("paperID"):
+                    return "cbpt_article"
+                if any(params.get(key) for key in ("colType", "tp", "yt", "st", "navigationContentID")):
+                    return "cbpt_list"
+                return "page"
             if lowered_path.endswith("/wklist.aspx"):
-                params = dict(parse_qsl(parts.query, keep_blank_values=True))
                 if params.get("contentID"):
                     return "cbpt_article"
                 return "cbpt_list"
@@ -697,8 +753,16 @@ class SiteCrawler:
             return False
         if any(parts.path.lower().endswith(suffix) for suffix in NON_HTML_SUFFIXES):
             return False
-        if self.site_family == "cbpt_cnki" and parts.path.lower().endswith("/downloadissueinfo.aspx"):
-            return False
+        if self.site_family == "cbpt_cnki":
+            lowered_path = parts.path.lower()
+            if (
+                lowered_path.endswith("/downloadissueinfo.aspx")
+                or lowered_path.endswith("/showvalidatecode.aspx")
+                or lowered_path.endswith("/validatecode.aspx")
+                or lowered_path.endswith("/wkdownfilebylink.aspx")
+                or lowered_path.endswith("/kbdownload.aspx")
+            ):
+                return False
         if self.is_ajcass and parts.fragment:
             return self.ajcass_route_from_url(normalized).startswith("/")
         return True
@@ -710,7 +774,7 @@ class SiteCrawler:
             return True
         if self.is_ajcass and self.page_kind(url) in AJCASS_LEAF_PAGE_KINDS:
             return False
-        if self.site_family == "cbpt_cnki" and self.page_kind(url) in {"cbpt_article", "cbpt_aux"}:
+        if self.site_family == "cbpt_cnki" and self.page_kind(url) in {"cbpt_article", "cbpt_aux", "cbpt_guard"}:
             return False
         return True
 
