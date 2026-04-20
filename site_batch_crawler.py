@@ -29,6 +29,7 @@ from playwright.async_api import (
 
 DEFAULT_CONFIG_PATH = "config.json"
 DEFAULT_INPUT_URLS_FILE = "input_urls.txt"
+CRAWL_POLICY_VERSION = 2
 AJCASS_HOST = "zgncjj.ajcass.com"
 AJCASS_HOST_SUFFIX = ".ajcass.com"
 AJCASS_SITE_CONTENT_API = "https://api.ajcass.com/api/JournalInfoApi/GetSiteContentPageList"
@@ -128,6 +129,30 @@ TRACKING_QUERY_KEYS = {
     "utm_source",
     "utm_term",
 }
+UNSAFE_ACTION_PATH_SEGMENTS = {
+    "delete",
+    "del",
+    "exit",
+    "logoff",
+    "logout",
+    "quit",
+    "remove",
+    "signoff",
+    "signout",
+}
+UNSAFE_ACTION_QUERY_PAIRS = {
+    ("action", "delete"),
+    ("action", "del"),
+    ("action", "logout"),
+    ("action", "logoff"),
+    ("action", "quit"),
+    ("action", "remove"),
+    ("do", "logout"),
+    ("method", "delete"),
+    ("method", "logout"),
+    ("op", "delete"),
+    ("op", "logout"),
+}
 
 
 @dataclass
@@ -182,7 +207,7 @@ class BatchConfig:
     checkpoint_every_pages: int = 10
     checkpoint_every_seconds: int = 30
     skip_completed_sites: bool = True
-    visit_leaf_pages: bool = False
+    visit_leaf_pages: bool = True
     include_site_homepage_seed: bool = True
     enable_generic_interactions: bool = True
     max_interaction_clicks_per_page: int = 18
@@ -206,7 +231,7 @@ class BatchConfig:
             checkpoint_every_pages=max(1, int(payload.get("checkpoint_every_pages", 10))),
             checkpoint_every_seconds=max(1, int(payload.get("checkpoint_every_seconds", 30))),
             skip_completed_sites=bool(payload.get("skip_completed_sites", True)),
-            visit_leaf_pages=bool(payload.get("visit_leaf_pages", False)),
+            visit_leaf_pages=bool(payload.get("visit_leaf_pages", True)),
             include_site_homepage_seed=bool(payload.get("include_site_homepage_seed", True)),
             enable_generic_interactions=bool(payload.get("enable_generic_interactions", True)),
             max_interaction_clicks_per_page=max(0, int(payload.get("max_interaction_clicks_per_page", 18))),
@@ -318,6 +343,28 @@ def cbpt_query_params(url: str) -> dict[str, str]:
         for key, value in parse_qsl(parts.query, keep_blank_values=True)
         if value != ""
     }
+
+
+def is_probably_unsafe_action_url(url: str) -> bool:
+    parts = urlsplit(url)
+    path_segments = [segment for segment in parts.path.lower().split("/") if segment]
+    if any(segment in UNSAFE_ACTION_PATH_SEGMENTS for segment in path_segments):
+        return True
+
+    for key, value in parse_qsl(parts.query, keep_blank_values=True):
+        lowered_key = key.lower()
+        lowered_value = value.lower()
+        if (lowered_key, lowered_value) in UNSAFE_ACTION_QUERY_PAIRS:
+            return True
+        if lowered_key in {"logout", "logoff", "signout", "signoff", "delete", "remove"}:
+            return lowered_value not in {"", "0", "false", "no"}
+    return False
+
+
+def checkpoint_matches_current_policy(checkpoint: dict[str, Any], visit_leaf_pages: bool) -> bool:
+    saved_version = int(checkpoint.get("crawl_policy_version", 0) or 0)
+    saved_visit_leaf_pages = bool(checkpoint.get("visit_leaf_pages", False))
+    return saved_version >= CRAWL_POLICY_VERSION and saved_visit_leaf_pages == visit_leaf_pages
 
 
 def sort_query(query: str) -> str:
@@ -523,6 +570,7 @@ class SiteCrawler:
 
     def _load_from_checkpoint(self, payload: dict[str, Any]) -> None:
         original_frontier_count = len(payload.get("frontier", []))
+        policy_matches = checkpoint_matches_current_policy(payload, self.config.visit_leaf_pages)
         self.frontier = [QueueItem(**item) for item in payload.get("frontier", [])]
         self.discovered_urls = {
             item["url"]: item for item in payload.get("discovered_urls", [])
@@ -544,6 +592,15 @@ class SiteCrawler:
         self.ajcass_known_routes = set(payload.get("ajcass_known_routes", self.ajcass_known_routes))
         self.ajcass_issue_route = str(payload.get("ajcass_issue_route", self.ajcass_issue_route))
         self.completed = bool(payload.get("completed", False))
+        if not policy_matches and self.completed:
+            self.completed = False
+            self.logger.info(
+                "Checkpoint policy mismatch detected; marking site incomplete old_version=%s new_version=%s old_visit_leaf_pages=%s new_visit_leaf_pages=%s",
+                payload.get("crawl_policy_version", 0),
+                CRAWL_POLICY_VERSION,
+                payload.get("visit_leaf_pages", False),
+                self.config.visit_leaf_pages,
+            )
         self._refresh_discovered_node_metadata()
         self.frontier = [
             item
@@ -753,12 +810,15 @@ class SiteCrawler:
             return False
         if any(parts.path.lower().endswith(suffix) for suffix in NON_HTML_SUFFIXES):
             return False
+        if is_probably_unsafe_action_url(normalized):
+            return False
         if self.site_family == "cbpt_cnki":
             lowered_path = parts.path.lower()
             if (
                 lowered_path.endswith("/downloadissueinfo.aspx")
                 or lowered_path.endswith("/showvalidatecode.aspx")
                 or lowered_path.endswith("/validatecode.aspx")
+                or lowered_path.endswith("/quit.aspx")
                 or lowered_path.endswith("/wkdownfilebylink.aspx")
                 or lowered_path.endswith("/kbdownload.aspx")
             ):
@@ -1686,6 +1746,8 @@ class SiteCrawler:
             "site_host": self.site_host,
             "site_origin": self.site_origin,
             "site_family": self.site_family,
+            "crawl_policy_version": CRAWL_POLICY_VERSION,
+            "visit_leaf_pages": self.config.visit_leaf_pages,
             "seed_urls": self.config.seed_urls,
             "completed": self.completed,
             "generated_at": int(time.time()),
@@ -1798,6 +1860,8 @@ class SiteCrawler:
             "site_key": self.config.site_key,
             "site_host": self.site_host,
             "site_origin": self.site_origin,
+            "crawl_policy_version": CRAWL_POLICY_VERSION,
+            "visit_leaf_pages": self.config.visit_leaf_pages,
             "seed_urls": self.config.seed_urls,
             "completed": self.completed,
             "frontier": [asdict(item) for item in self.frontier],
@@ -1902,7 +1966,8 @@ class BatchRunner:
             checkpoint_path = site_config.output_dir / "checkpoint.json"
             if checkpoint_path.exists():
                 checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
-                if checkpoint.get("completed") and self.batch_config.skip_completed_sites:
+                policy_matches = checkpoint_matches_current_policy(checkpoint, self.batch_config.visit_leaf_pages)
+                if checkpoint.get("completed") and self.batch_config.skip_completed_sites and policy_matches:
                     summary_path = site_config.output_dir / "summary.json"
                     self.logger.info(
                         "Skipping completed site site=%s checkpoint=%s",
@@ -1912,6 +1977,16 @@ class BatchRunner:
                     if summary_path.exists():
                         batch_results.append(json.loads(summary_path.read_text(encoding="utf-8")))
                     continue
+                if checkpoint.get("completed") and self.batch_config.skip_completed_sites and not policy_matches:
+                    self.logger.info(
+                        "Checkpoint policy changed; resuming site site=%s checkpoint=%s old_version=%s new_version=%s old_visit_leaf_pages=%s new_visit_leaf_pages=%s",
+                        site_config.site_key,
+                        checkpoint_path,
+                        checkpoint.get("crawl_policy_version", 0),
+                        CRAWL_POLICY_VERSION,
+                        checkpoint.get("visit_leaf_pages", False),
+                        self.batch_config.visit_leaf_pages,
+                    )
 
             try:
                 self.logger.info(

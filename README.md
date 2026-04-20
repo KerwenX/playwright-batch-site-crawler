@@ -12,6 +12,13 @@
 - 跳过已完成站点
 - 额外输出全局汇总和 CSV 文件
 
+默认抓取策略是：
+
+- 所有“同站点、可访问、像 HTML 的 URL”都会入队并访问一次
+- 非本站点 URL 只记录，不会继续向下挖
+- 资源文件、下载链接、明显危险的动作链接默认不入队
+- 站点专用规则只用于补充发现能力或避免误入无意义页面，不再作为默认主策略
+
 ## 已支持的站点形态
 
 - 通用传统站点：服务端渲染、普通 `<a>` 链接
@@ -23,7 +30,7 @@
 - `wkTextContent.aspx` 的目录页、年卷页、期次页、栏目索引页
 - `wkList.aspx` 的列表页和导航页
 - 编辑后台、验证码页、下载接口会记录，但默认不继续访问
-- `paperDigest.aspx`、`wkTextContent.aspx?contentID=...` 这类正文叶子页默认只记录 URL，不逐个打开
+- `paperDigest.aspx`、`wkTextContent.aspx?contentID=...` 这类正文页在默认配置下也会实际访问；如果你只想保留 URL 不逐个打开，可以把 `visit_leaf_pages` 改成 `false`
 
 已验证示例：
 
@@ -65,7 +72,7 @@
   "checkpoint_every_pages": 10,
   "checkpoint_every_seconds": 30,
   "skip_completed_sites": true,
-  "visit_leaf_pages": false,
+  "visit_leaf_pages": true,
   "include_site_homepage_seed": true,
   "enable_generic_interactions": true,
   "max_interaction_clicks_per_page": 18,
@@ -79,7 +86,8 @@
 - `log_level = "INFO"`：默认打印关键运行日志；改成 `"DEBUG"` 可看到更细的 URL 入队和发现细节
 - `log_to_file = true`：除了控制台，还会把日志写入文件
 - `max_pages_per_site = 0`：不限制页面访问数
-- `visit_leaf_pages = false`：详情页 URL 记录下来，但默认不逐个打开
+- `visit_leaf_pages = true`：默认按“站内全量 BFS”执行，同站可访问 HTML 页都会继续访问
+- `visit_leaf_pages = false`：退回到偏保守模式，部分已识别的详情叶子页只记录 URL，不逐个打开
 - `enable_generic_interactions = true`：开启通用交互探测
 - `max_interaction_clicks_per_page`：每页最多做多少次交互点击
 - `max_api_pages_per_series = 0`：单个分页接口不设上限；如果只想快测，可改成 `10`、`50` 之类
@@ -138,6 +146,8 @@ https://zgfx.cbpt.cnki.net/
 - 已访问 URL 不会重复抓取
 - 已完成站点不会重复跑
 - 如果升级了站点规则，程序会在恢复检查点时重新评估已发现 URL，并把现在应继续访问但过去被错误跳过的 URL 重新入队
+- 如果旧检查点是用更保守的抓取策略生成的，程序会自动识别策略版本变化，不会把这些站点误判成“已完成”
+- 即使开启“站内全量 BFS”，也仍然会跳过资源文件、下载链接和明显危险的动作 URL，避免误触发退出、删除等站点操作
 - 如果设置了 `max_pages_per_site`，达到上限时会保持 `completed = false`
 
 ## 输出结构

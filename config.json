@@ -12,7 +12,7 @@
   "checkpoint_every_pages": 10,
   "checkpoint_every_seconds": 30,
   "skip_completed_sites": true,
-  "visit_leaf_pages": false,
+  "visit_leaf_pages": true,
   "include_site_homepage_seed": true,
   "enable_generic_interactions": true,
   "max_interaction_clicks_per_page": 18,
