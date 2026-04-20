@@ -47,6 +47,8 @@
   "input_urls_file": "input_urls.txt",
   "output_root": "crawl_output_batch",
   "chromium_executable_path": "",
+  "log_level": "INFO",
+  "log_to_file": true,
   "headless": true,
   "max_concurrency": 8,
   "page_timeout_ms": 20000,
@@ -66,6 +68,8 @@
 关键配置说明：
 
 - `chromium_executable_path = ""`：留空时使用 Playwright 默认 Chromium；填写后使用你指定的 `chrome.exe` / `chromium.exe`
+- `log_level = "INFO"`：默认打印关键运行日志；改成 `"DEBUG"` 可看到更细的 URL 入队和发现细节
+- `log_to_file = true`：除了控制台，还会把日志写入文件
 - `max_pages_per_site = 0`：不限制页面访问数
 - `visit_leaf_pages = false`：详情页 URL 记录下来，但默认不逐个打开
 - `enable_generic_interactions = true`：开启通用交互探测
@@ -79,6 +83,13 @@
 - 可以写相对路径，程序会按 `config.json` 所在目录解析
 - 可以写带环境变量的路径，例如 `%LOCALAPPDATA%\\ms-playwright\\chromium-1208\\chrome-win64\\chrome.exe`
 - 如果路径不存在，程序会在启动时直接报错，避免你误以为已经使用了指定浏览器
+
+日志说明：
+
+- 根目录会输出 `batch.log`，记录批量任务入口、跳过已完成站点、站点开始/结束、全局汇总写出位置
+- 每个站点目录会输出 `crawl.log`，记录检查点恢复、浏览器启动、批次进度、页面访问开始/结束、异常堆栈、检查点保存
+- `INFO` 级别适合日常跑批定位问题
+- `DEBUG` 级别适合深入排查某个站点为什么没有入队、为什么某些 URL 没继续抓
 
 ## 输入
 
@@ -124,6 +135,7 @@ https://zgfx.cbpt.cnki.net/
 
 ```text
 crawl_output_batch/
+  batch.log
   all_discovered_urls.txt
   all_discovered_urls.tsv
   all_discovered_urls.csv
@@ -132,6 +144,7 @@ crawl_output_batch/
   zgncjj_ajcass_com/
     all_discovered_urls.txt
     checkpoint.json
+    crawl.log
     edges.jsonl
     edges.csv
     external_or_non_queueable_urls.txt
