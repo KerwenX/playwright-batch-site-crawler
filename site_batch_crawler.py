@@ -5,6 +5,7 @@ import asyncio
 import csv
 import io
 import json
+import os
 import re
 import time
 import traceback
@@ -169,6 +170,7 @@ class PageVisit:
 class BatchConfig:
     input_urls_file: str
     output_root: str
+    chromium_executable_path: str = ""
     headless: bool = True
     max_concurrency: int = 8
     page_timeout_ms: int = 20000
@@ -186,9 +188,11 @@ class BatchConfig:
     @classmethod
     def from_file(cls, path: str | Path) -> "BatchConfig":
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        base_dir = Path(path).resolve().parent
         return cls(
             input_urls_file=str(payload.get("input_urls_file", DEFAULT_INPUT_URLS_FILE)),
             output_root=str(payload.get("output_root", "crawl_output")),
+            chromium_executable_path=resolve_optional_path(payload.get("chromium_executable_path", ""), base_dir),
             headless=bool(payload.get("headless", True)),
             max_concurrency=int(payload.get("max_concurrency", 8)),
             page_timeout_ms=int(payload.get("page_timeout_ms", 20000)),
@@ -212,6 +216,7 @@ class SiteConfig:
     site_origin: str
     output_dir: Path
     seed_urls: list[str]
+    chromium_executable_path: str
     headless: bool
     max_concurrency: int
     timeout_ms: int
@@ -242,6 +247,16 @@ def atomic_write_csv(path: Path, rows: list[dict[str, Any]], fieldnames: list[st
 
 def sanitize_site_key(site_key: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", site_key.lower()).strip("_")
+
+
+def resolve_optional_path(raw_value: Any, base_dir: Path) -> str:
+    value = str(raw_value or "").strip()
+    if not value:
+        return ""
+    expanded = Path(os.path.expandvars(os.path.expanduser(value)))
+    if not expanded.is_absolute():
+        expanded = (base_dir / expanded).resolve()
+    return str(expanded)
 
 
 def sort_query(query: str) -> str:
@@ -375,7 +390,15 @@ class SiteCrawler:
     async def __aenter__(self) -> "SiteCrawler":
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
         self.playwright = await async_playwright().start()
-        self.browser = await self.playwright.chromium.launch(headless=self.config.headless)
+        launch_kwargs: dict[str, Any] = {"headless": self.config.headless}
+        if self.config.chromium_executable_path:
+            executable_path = Path(self.config.chromium_executable_path)
+            if not executable_path.exists():
+                raise FileNotFoundError(
+                    f"Configured chromium_executable_path does not exist: {executable_path}"
+                )
+            launch_kwargs["executable_path"] = str(executable_path)
+        self.browser = await self.playwright.chromium.launch(**launch_kwargs)
         self.context = await self.browser.new_context(ignore_https_errors=True, accept_downloads=True)
         self.context.set_default_timeout(self.config.timeout_ms)
         self.api_context = await self.playwright.request.new_context(ignore_https_errors=True)
@@ -1568,6 +1591,7 @@ class BatchRunner:
                     site_origin=payload["site_origin"],
                     output_dir=self.output_root / folder_name,
                     seed_urls=payload["seed_urls"],
+                    chromium_executable_path=self.batch_config.chromium_executable_path,
                     headless=self.batch_config.headless,
                     max_concurrency=self.batch_config.max_concurrency,
                     timeout_ms=self.batch_config.page_timeout_ms,

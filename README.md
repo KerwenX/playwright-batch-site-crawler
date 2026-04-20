@@ -46,6 +46,7 @@
 {
   "input_urls_file": "input_urls.txt",
   "output_root": "crawl_output_batch",
+  "chromium_executable_path": "",
   "headless": true,
   "max_concurrency": 8,
   "page_timeout_ms": 20000,
@@ -64,12 +65,20 @@
 
 关键配置说明：
 
+- `chromium_executable_path = ""`：留空时使用 Playwright 默认 Chromium；填写后使用你指定的 `chrome.exe` / `chromium.exe`
 - `max_pages_per_site = 0`：不限制页面访问数
 - `visit_leaf_pages = false`：详情页 URL 记录下来，但默认不逐个打开
 - `enable_generic_interactions = true`：开启通用交互探测
 - `max_interaction_clicks_per_page`：每页最多做多少次交互点击
 - `max_api_pages_per_series = 0`：单个分页接口不设上限；如果只想快测，可改成 `10`、`50` 之类
 - `skip_completed_sites = true`：已完成站点直接跳过
+
+`chromium_executable_path` 使用说明：
+
+- 可以写绝对路径，例如 `C:\\Program Files\\Chromium\\Application\\chrome.exe`
+- 可以写相对路径，程序会按 `config.json` 所在目录解析
+- 可以写带环境变量的路径，例如 `%LOCALAPPDATA%\\ms-playwright\\chromium-1208\\chrome-win64\\chrome.exe`
+- 如果路径不存在，程序会在启动时直接报错，避免你误以为已经使用了指定浏览器
 
 ## 输入
 

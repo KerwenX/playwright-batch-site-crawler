@@ -1,6 +1,7 @@
 {
   "input_urls_file": "input_urls.txt",
   "output_root": "crawl_output_batch",
+  "chromium_executable_path": "",
   "headless": true,
   "max_concurrency": 8,
   "page_timeout_ms": 20000,
