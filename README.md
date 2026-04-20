@@ -1,6 +1,6 @@
 # Playwright Batch Site Crawler
 
-基于本地 `Python 3.14` 和 Playwright 的站点级分层爬虫。
+基于 Playwright 的站点级分层爬虫，当前代码同时兼容本地 `Python 3.14` 和服务器 Docker 中的 `Python 3.8`。
 
 程序会：
 
@@ -76,7 +76,19 @@
   "include_site_homepage_seed": true,
   "enable_generic_interactions": true,
   "max_interaction_clicks_per_page": 18,
-  "max_api_pages_per_series": 0
+  "max_api_pages_per_series": 0,
+  "proxy_servers": [],
+  "proxy_session_count": 0,
+  "skip_failed_proxies": true,
+  "browser_launch_args": [
+    "--disable-blink-features=AutomationControlled",
+    "--disable-gpu",
+    "--disable-dev-shm-usage",
+    "--incognito"
+  ],
+  "enable_request_blocking": true,
+  "blocked_resource_types": ["image", "media", "font", "ping"],
+  "blocked_url_suffixes": [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".svg", ".ico", ".woff", ".woff2", ".ttf", ".m4s"]
 }
 ```
 
@@ -91,6 +103,11 @@
 - `enable_generic_interactions = true`：开启通用交互探测
 - `max_interaction_clicks_per_page`：每页最多做多少次交互点击
 - `max_api_pages_per_series = 0`：单个分页接口不设上限；如果只想快测，可改成 `10`、`50` 之类
+- `proxy_servers = []`：代理池列表；留空表示直连
+- `proxy_session_count = 0`：单站点代理会话数；`0` 表示自动按并发和代理数量取值
+- `skip_failed_proxies = true`：某个代理启动失败时跳过它，继续使用剩余代理
+- `browser_launch_args`：服务器或 Docker 下传给 Chromium 的启动参数
+- `enable_request_blocking = true`：阻断图片、字体、媒体等低价值资源，降低带宽和代理压力
 - `skip_completed_sites = true`：已完成站点直接跳过
 
 `chromium_executable_path` 使用说明：
@@ -138,6 +155,12 @@ https://zgfx.cbpt.cnki.net/
 & 'C:\Python314\python.exe' site_batch_crawler.py
 ```
 
+服务器 Docker 入口：
+
+```bash
+python3 server_batch_crawler.py
+```
+
 ## 断点续传
 
 每个站点目录下都有 `checkpoint.json`。
@@ -149,6 +172,58 @@ https://zgfx.cbpt.cnki.net/
 - 如果旧检查点是用更保守的抓取策略生成的，程序会自动识别策略版本变化，不会把这些站点误判成“已完成”
 - 即使开启“站内全量 BFS”，也仍然会跳过资源文件、下载链接和明显危险的动作 URL，避免误触发退出、删除等站点操作
 - 如果设置了 `max_pages_per_site`，达到上限时会保持 `completed = false`
+
+## 服务器 Docker
+
+推荐把仓库放到服务器挂载目录后，新增一个不纳入 Git 的 `config.server.json`，可以直接参考 [config.server.example.json](/D:/Desktop/qoder%20work/config.server.example.json)。
+
+建议的关键点：
+
+- 服务器上使用 `server_batch_crawler.py` 作为入口，默认读取 `config.server.json`
+- 如果需要换配置文件，可以用环境变量 `CRAWLER_CONFIG_PATH`
+- 代理池配置写在 `proxy_servers` 里，程序会按会话轮转使用不同代理
+- `proxy_session_count = 0` 时，默认取 `min(max_concurrency, 代理数量)`
+- 页面导航和 AJCASS 分页 API 会尽量复用同一个代理会话
+- 默认开启请求瘦身，会阻断图片、媒体、字体等低价值资源
+
+服务器配置字段：
+
+- `proxy_servers`：代理池，支持字符串列表，也支持对象形式 `{server, username, password, label}`
+- `proxy_session_count`：单站点同时启用多少个代理会话
+- `skip_failed_proxies`：坏代理是否自动跳过
+- `browser_launch_args`：Docker/服务器环境下传给 Chromium 的启动参数
+- `enable_request_blocking`：是否拦截图片、字体、媒体等资源
+- `blocked_resource_types`：按 Playwright `resource_type` 阻断的类型
+- `blocked_url_suffixes`：按 URL 后缀阻断的资源
+
+Docker 运行示例：
+
+```bash
+docker run --rm -it \
+  --network host \
+  -e PYTHONUNBUFFERED=1 \
+  -e CRAWLER_CONFIG_PATH=config.server.json \
+  --shm-size=1g \
+  -v /opt/huawei/data2/w00943222/spider:/opt/huawei/data2/w00943222/spider \
+  -w /opt/huawei/data2/w00943222/spider \
+  --entrypoint python3 \
+  playwright_focal:3.21.2 \
+  ./server_batch_crawler.py
+```
+
+如果你想继续用原入口，也可以：
+
+```bash
+docker run --rm -it \
+  --network host \
+  -e PYTHONUNBUFFERED=1 \
+  --shm-size=1g \
+  -v /opt/huawei/data2/w00943222/spider:/opt/huawei/data2/w00943222/spider \
+  -w /opt/huawei/data2/w00943222/spider \
+  --entrypoint python3 \
+  playwright_focal:3.21.2 \
+  -c "from site_batch_crawler import main; raise SystemExit(main('config.server.json'))"
+```
 
 ## 输出结构
 
@@ -186,6 +261,7 @@ crawl_output_batch/
 ## 当前入口文件
 
 - [ajcass_crawler.py](/D:/Desktop/qoder%20work/ajcass_crawler.py)
+- [server_batch_crawler.py](/D:/Desktop/qoder%20work/server_batch_crawler.py)
 - [site_batch_crawler.py](/D:/Desktop/qoder%20work/site_batch_crawler.py)
 
-`ajcass_crawler.py` 只是入口，核心逻辑都在 `site_batch_crawler.py`。
+`ajcass_crawler.py` 和 `server_batch_crawler.py` 都只是入口，核心逻辑都在 `site_batch_crawler.py`。

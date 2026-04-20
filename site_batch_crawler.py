@@ -11,9 +11,9 @@ import re
 import time
 import traceback
 from collections import Counter, defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from playwright.async_api import (
@@ -153,6 +153,45 @@ UNSAFE_ACTION_QUERY_PAIRS = {
     ("op", "delete"),
     ("op", "logout"),
 }
+DEFAULT_BROWSER_LAUNCH_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--disable-gpu",
+    "--disable-dev-shm-usage",
+    "--incognito",
+]
+DEFAULT_BLOCKED_RESOURCE_TYPES = [
+    "image",
+    "media",
+    "font",
+    "ping",
+]
+DEFAULT_BLOCKED_URL_SUFFIXES = [
+    ".bmp",
+    ".eot",
+    ".gif",
+    ".ico",
+    ".jpeg",
+    ".jpg",
+    ".m4s",
+    ".mp3",
+    ".mp4",
+    ".png",
+    ".svg",
+    ".ttf",
+    ".wav",
+    ".webm",
+    ".webp",
+    ".woff",
+    ".woff2",
+]
+FORCE_OPEN_SHADOW_ROOTS_SCRIPT = """(function() {
+    if (!Element.prototype._attachShadow) {
+        Element.prototype._attachShadow = Element.prototype.attachShadow;
+        Element.prototype.attachShadow = function () {
+            return this._attachShadow({mode:'open'});
+        };
+    }
+})();"""
 
 
 @dataclass
@@ -180,6 +219,7 @@ class PageVisit:
     final_url: str
     depth: int
     page_kind: str
+    proxy: str
     title: str
     ok: bool
     error: str = ""
@@ -212,9 +252,16 @@ class BatchConfig:
     enable_generic_interactions: bool = True
     max_interaction_clicks_per_page: int = 18
     max_api_pages_per_series: int = 0
+    proxy_servers: List[Dict[str, str]] = field(default_factory=list)
+    proxy_session_count: int = 0
+    skip_failed_proxies: bool = True
+    browser_launch_args: List[str] = field(default_factory=list)
+    enable_request_blocking: bool = True
+    blocked_resource_types: List[str] = field(default_factory=list)
+    blocked_url_suffixes: List[str] = field(default_factory=list)
 
     @classmethod
-    def from_file(cls, path: str | Path) -> "BatchConfig":
+    def from_file(cls, path: Union[str, Path]) -> "BatchConfig":
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
         base_dir = Path(path).resolve().parent
         return cls(
@@ -236,6 +283,13 @@ class BatchConfig:
             enable_generic_interactions=bool(payload.get("enable_generic_interactions", True)),
             max_interaction_clicks_per_page=max(0, int(payload.get("max_interaction_clicks_per_page", 18))),
             max_api_pages_per_series=max(0, int(payload.get("max_api_pages_per_series", 0))),
+            proxy_servers=load_proxy_servers(payload.get("proxy_servers")),
+            proxy_session_count=max(0, int(payload.get("proxy_session_count", 0))),
+            skip_failed_proxies=bool(payload.get("skip_failed_proxies", True)),
+            browser_launch_args=normalize_string_list(payload.get("browser_launch_args")) or list(DEFAULT_BROWSER_LAUNCH_ARGS),
+            enable_request_blocking=bool(payload.get("enable_request_blocking", True)),
+            blocked_resource_types=normalize_string_list(payload.get("blocked_resource_types"), lower=True) or list(DEFAULT_BLOCKED_RESOURCE_TYPES),
+            blocked_url_suffixes=normalize_string_list(payload.get("blocked_url_suffixes"), lower=True) or list(DEFAULT_BLOCKED_URL_SUFFIXES),
         )
 
 
@@ -260,6 +314,22 @@ class SiteConfig:
     enable_generic_interactions: bool
     max_interaction_clicks_per_page: int
     max_api_pages_per_series: int
+    proxy_servers: List[Dict[str, str]]
+    proxy_session_count: int
+    skip_failed_proxies: bool
+    browser_launch_args: List[str]
+    enable_request_blocking: bool
+    blocked_resource_types: List[str]
+    blocked_url_suffixes: List[str]
+
+
+@dataclass
+class CrawlerSession:
+    index: int
+    proxy_label: str
+    browser: Browser
+    context: BrowserContext
+    api_context: Any
 
 
 def atomic_write_text(path: Path, content: str) -> None:
@@ -291,6 +361,65 @@ def resolve_optional_path(raw_value: Any, base_dir: Path) -> str:
     return str(expanded)
 
 
+def normalize_string_list(raw_value: Any, lower: bool = False) -> List[str]:
+    values = raw_value if isinstance(raw_value, list) else []
+    results = []
+    for item in values:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        results.append(text.lower() if lower else text)
+    return results
+
+
+def load_proxy_servers(raw_value: Any) -> List[Dict[str, str]]:
+    items = raw_value if isinstance(raw_value, list) else []
+    proxies = []
+    for item in items:
+        if isinstance(item, str):
+            server = item.strip()
+            if not server:
+                continue
+            proxies.append({"server": server, "username": "", "password": "", "label": server})
+            continue
+        if isinstance(item, dict):
+            server = str(item.get("server") or "").strip()
+            if not server:
+                continue
+            proxies.append(
+                {
+                    "server": server,
+                    "username": str(item.get("username") or "").strip(),
+                    "password": str(item.get("password") or "").strip(),
+                    "label": str(item.get("label") or server).strip(),
+                }
+            )
+    return proxies
+
+
+def build_playwright_proxy_settings(proxy_entry: Optional[Dict[str, str]]) -> Optional[Dict[str, str]]:
+    if not proxy_entry:
+        return None
+    server = str(proxy_entry.get("server") or "").strip()
+    if not server:
+        return None
+    settings = {"server": server}
+    username = str(proxy_entry.get("username") or "").strip()
+    password = str(proxy_entry.get("password") or "").strip()
+    if username:
+        settings["username"] = username
+    if password:
+        settings["password"] = password
+    return settings
+
+
+def get_proxy_label(proxy_entry: Optional[Dict[str, str]]) -> str:
+    if not proxy_entry:
+        return "<direct>"
+    label = str(proxy_entry.get("label") or proxy_entry.get("server") or "").strip()
+    return label or "<direct>"
+
+
 def normalize_log_level(raw_value: Any) -> int:
     value = str(raw_value or "INFO").upper()
     return getattr(logging, value, logging.INFO)
@@ -305,7 +434,7 @@ def reset_logger_handlers(logger: logging.Logger) -> None:
             pass
 
 
-def configure_logger(name: str, level_name: str, *, log_file: Path | None = None) -> logging.Logger:
+def configure_logger(name: str, level_name: str, *, log_file: Optional[Path] = None) -> logging.Logger:
     level = normalize_log_level(level_name)
     logger = logging.getLogger(name)
     logger.setLevel(level)
@@ -336,7 +465,7 @@ def truncate_text(value: str, limit: int = 120) -> str:
     return text[: limit - 3] + "..."
 
 
-def cbpt_query_params(url: str) -> dict[str, str]:
+def cbpt_query_params(url: str) -> Dict[str, str]:
     parts = urlsplit(url)
     return {
         key: value
@@ -361,7 +490,7 @@ def is_probably_unsafe_action_url(url: str) -> bool:
     return False
 
 
-def checkpoint_matches_current_policy(checkpoint: dict[str, Any], visit_leaf_pages: bool) -> bool:
+def checkpoint_matches_current_policy(checkpoint: Dict[str, Any], visit_leaf_pages: bool) -> bool:
     saved_version = int(checkpoint.get("crawl_policy_version", 0) or 0)
     saved_visit_leaf_pages = bool(checkpoint.get("visit_leaf_pages", False))
     return saved_version >= CRAWL_POLICY_VERSION and saved_visit_leaf_pages == visit_leaf_pages
@@ -381,7 +510,7 @@ def is_ajcass_host(host: str) -> bool:
     return lowered == "ajcass.com" or lowered.endswith(AJCASS_HOST_SUFFIX)
 
 
-def normalize_seed_url(raw_url: str) -> str | None:
+def normalize_seed_url(raw_url: str) -> Optional[str]:
     candidate = raw_url.strip()
     if not candidate or candidate.startswith("#"):
         return None
@@ -399,10 +528,10 @@ def normalize_seed_url(raw_url: str) -> str | None:
     return urlunsplit((parts.scheme.lower(), netloc, path, query, parts.fragment))
 
 
-def load_seed_urls(path: Path) -> list[str]:
+def load_seed_urls(path: Path) -> List[str]:
     if not path.exists():
         raise FileNotFoundError(f"Input URL file not found: {path}")
-    urls: list[str] = []
+    urls: List[str] = []
     for raw_line in path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
@@ -413,8 +542,8 @@ def load_seed_urls(path: Path) -> list[str]:
     return urls
 
 
-def group_urls_by_site(urls: list[str], include_homepage_seed: bool) -> dict[str, dict[str, Any]]:
-    grouped: dict[str, dict[str, Any]] = {}
+def group_urls_by_site(urls: List[str], include_homepage_seed: bool) -> Dict[str, Dict[str, Any]]:
+    grouped: Dict[str, Dict[str, Any]] = {}
     for url in urls:
         parts = urlsplit(url)
         host = parts.hostname or ""
@@ -454,27 +583,29 @@ class SiteCrawler:
             log_file=(self.config.output_dir / "crawl.log") if self.config.log_to_file else None,
         )
 
-        self.playwright: Playwright | None = None
-        self.browser: Browser | None = None
-        self.context: BrowserContext | None = None
+        self.playwright: Optional[Playwright] = None
+        self.browser: Optional[Browser] = None
+        self.context: Optional[BrowserContext] = None
         self.api_context = None
+        self.sessions: List[CrawlerSession] = []
+        self.session_index = 0
 
-        self.frontier: list[QueueItem] = []
-        self.discovered_urls: dict[str, dict[str, Any]] = {}
-        self.visited_urls: set[str] = set()
-        self.queued_urls: set[str] = set()
-        self.edges: list[Discovery] = []
-        self.visits: list[PageVisit] = []
-        self.discovered_via_source: set[tuple[str, str, str]] = set()
+        self.frontier: List[QueueItem] = []
+        self.discovered_urls: Dict[str, Dict[str, Any]] = {}
+        self.visited_urls: Set[str] = set()
+        self.queued_urls: Set[str] = set()
+        self.edges: List[Discovery] = []
+        self.visits: List[PageVisit] = []
+        self.discovered_via_source: Set[Tuple[str, str, str]] = set()
 
-        self.expected_issue_search_urls: set[str] = set()
-        self.expected_issue_detail_urls: set[str] = set()
-        self.expected_static_detail_urls: set[str] = set()
-        self.expected_en_issue_urls: set[str] = set()
-        self.processed_api_requests: set[str] = set()
-        self.fetched_api_pages: set[str] = set()
-        self.processed_script_requests: set[str] = set()
-        self.ajcass_known_routes: set[str] = set()
+        self.expected_issue_search_urls: Set[str] = set()
+        self.expected_issue_detail_urls: Set[str] = set()
+        self.expected_static_detail_urls: Set[str] = set()
+        self.expected_en_issue_urls: Set[str] = set()
+        self.processed_api_requests: Set[str] = set()
+        self.fetched_api_pages: Set[str] = set()
+        self.processed_script_requests: Set[str] = set()
+        self.ajcass_known_routes: Set[str] = set()
         self.ajcass_issue_route = "/issueDetail" if self.site_host == AJCASS_HOST else "/issue"
         if self.is_ajcass:
             if self.site_host == AJCASS_HOST:
@@ -513,36 +644,148 @@ class SiteCrawler:
 
     async def __aenter__(self) -> "SiteCrawler":
         self.playwright = await async_playwright().start()
-        launch_kwargs: dict[str, Any] = {"headless": self.config.headless}
+        session_proxies = self.build_session_proxies()
+        self.logger.info(
+            "Launching crawler sessions count=%s proxies=%s headless=%s chromium_executable_path=%s",
+            len(session_proxies),
+            [get_proxy_label(item) for item in session_proxies],
+            self.config.headless,
+            self.config.chromium_executable_path or "<playwright-default>",
+        )
+        for index, proxy_entry in enumerate(session_proxies, start=1):
+            proxy_label = get_proxy_label(proxy_entry)
+            browser = None
+            context = None
+            api_context = None
+            try:
+                proxy_settings = build_playwright_proxy_settings(proxy_entry)
+                launch_kwargs = self.build_launch_kwargs(proxy_settings)
+                browser = await self.playwright.chromium.launch(**launch_kwargs)
+                context = await browser.new_context(ignore_https_errors=True, accept_downloads=True)
+                context.set_default_timeout(self.config.timeout_ms)
+                await context.add_init_script(FORCE_OPEN_SHADOW_ROOTS_SCRIPT)
+                api_context = await self.build_api_context(proxy_settings)
+                self.sessions.append(
+                    CrawlerSession(
+                        index=index,
+                        proxy_label=proxy_label,
+                        browser=browser,
+                        context=context,
+                        api_context=api_context,
+                    )
+                )
+                self.logger.info(
+                    "Crawler session ready index=%s proxy=%s timeout_ms=%s settle_ms=%s",
+                    index,
+                    proxy_label,
+                    self.config.timeout_ms,
+                    self.config.settle_ms,
+                )
+            except Exception:
+                self.logger.exception("Failed to initialize crawler session index=%s proxy=%s", index, proxy_label)
+                if api_context is not None:
+                    try:
+                        await api_context.dispose()
+                    except Exception:
+                        pass
+                if context is not None:
+                    try:
+                        await context.close()
+                    except Exception:
+                        pass
+                if browser is not None:
+                    try:
+                        await browser.close()
+                    except Exception:
+                        pass
+                if not self.config.skip_failed_proxies:
+                    raise
+        if not self.sessions:
+            raise RuntimeError("No crawler sessions were initialized.")
+        self.browser = self.sessions[0].browser
+        self.context = self.sessions[0].context
+        self.api_context = self.sessions[0].api_context
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        for session in self.sessions:
+            if session.api_context is not None:
+                await session.api_context.dispose()
+            if session.context is not None:
+                await session.context.close()
+            if session.browser is not None:
+                await session.browser.close()
+        if self.playwright is not None:
+            await self.playwright.stop()
+        self.sessions = []
+        self.logger.info("Browser resources closed site=%s", self.config.site_key)
+
+    def build_session_proxies(self) -> List[Optional[Dict[str, str]]]:
+        if not self.config.proxy_servers:
+            return [None]
+        session_count = self.config.proxy_session_count or min(self.config.max_concurrency, len(self.config.proxy_servers))
+        session_count = max(1, session_count)
+        proxies = []
+        site_offset = sum(ord(ch) for ch in self.config.site_key) % len(self.config.proxy_servers)
+        for index in range(session_count):
+            proxies.append(self.config.proxy_servers[(site_offset + index) % len(self.config.proxy_servers)])
+        return proxies
+
+    def build_launch_kwargs(self, proxy_settings: Optional[Dict[str, str]]) -> Dict[str, Any]:
+        launch_kwargs = {
+            "headless": self.config.headless,
+            "args": list(self.config.browser_launch_args),
+        }
         if self.config.chromium_executable_path:
             executable_path = Path(self.config.chromium_executable_path)
             if not executable_path.exists():
                 raise FileNotFoundError(
-                    f"Configured chromium_executable_path does not exist: {executable_path}"
+                    "Configured chromium_executable_path does not exist: {0}".format(executable_path)
                 )
             launch_kwargs["executable_path"] = str(executable_path)
-        self.logger.info(
-            "Launching browser headless=%s chromium_executable_path=%s",
-            self.config.headless,
-            self.config.chromium_executable_path or "<playwright-default>",
-        )
-        self.browser = await self.playwright.chromium.launch(**launch_kwargs)
-        self.context = await self.browser.new_context(ignore_https_errors=True, accept_downloads=True)
-        self.context.set_default_timeout(self.config.timeout_ms)
-        self.api_context = await self.playwright.request.new_context(ignore_https_errors=True)
-        self.logger.info("Browser context ready timeout_ms=%s settle_ms=%s", self.config.timeout_ms, self.config.settle_ms)
-        return self
+        if proxy_settings:
+            launch_kwargs["proxy"] = proxy_settings
+        return launch_kwargs
 
-    async def __aexit__(self, exc_type, exc, tb) -> None:
-        if self.api_context is not None:
-            await self.api_context.dispose()
-        if self.context is not None:
-            await self.context.close()
-        if self.browser is not None:
-            await self.browser.close()
-        if self.playwright is not None:
-            await self.playwright.stop()
-        self.logger.info("Browser resources closed site=%s", self.config.site_key)
+    async def build_api_context(self, proxy_settings: Optional[Dict[str, str]]) -> Any:
+        api_kwargs = {"ignore_https_errors": True}
+        if proxy_settings:
+            api_kwargs["proxy"] = proxy_settings
+        try:
+            return await self.playwright.request.new_context(**api_kwargs)
+        except TypeError:
+            if proxy_settings:
+                self.logger.warning(
+                    "Playwright request context does not accept proxy in this build; falling back to direct API context proxy=%s",
+                    proxy_settings.get("server"),
+                )
+            return await self.playwright.request.new_context(ignore_https_errors=True)
+
+    def get_next_session(self) -> CrawlerSession:
+        if not self.sessions:
+            raise RuntimeError("Crawler session pool is not initialized.")
+        session = self.sessions[self.session_index % len(self.sessions)]
+        self.session_index += 1
+        return session
+
+    async def handle_route(self, route) -> None:
+        request = route.request
+        request_url = request.url.lower()
+        resource_type = (request.resource_type or "").lower()
+        try:
+            if self.config.enable_request_blocking:
+                if resource_type in set(self.config.blocked_resource_types):
+                    await route.abort()
+                    return
+                if any(request_url.endswith(suffix) for suffix in self.config.blocked_url_suffixes):
+                    await route.abort()
+                    return
+            await route.continue_()
+        except Exception:
+            try:
+                await route.continue_()
+            except Exception:
+                pass
 
     def detect_site_family(self) -> str:
         if is_ajcass_host(self.site_host):
@@ -568,7 +811,7 @@ class SiteCrawler:
         self._initialize_from_seed_urls(self.config.seed_urls)
         self.logger.info("Initialized new crawl state from seed URLs count=%s", len(self.config.seed_urls))
 
-    def _load_from_checkpoint(self, payload: dict[str, Any]) -> None:
+    def _load_from_checkpoint(self, payload: Dict[str, Any]) -> None:
         original_frontier_count = len(payload.get("frontier", []))
         policy_matches = checkpoint_matches_current_policy(payload, self.config.visit_leaf_pages)
         self.frontier = [QueueItem(**item) for item in payload.get("frontier", [])]
@@ -578,7 +821,12 @@ class SiteCrawler:
         self.visited_urls = set(payload.get("visited_urls", []))
         self.queued_urls = set(payload.get("queued_urls", []))
         self.edges = [Discovery(**item) for item in payload.get("edges", [])]
-        self.visits = [PageVisit(**item) for item in payload.get("visits", [])]
+        self.visits = []
+        for item in payload.get("visits", []):
+            if isinstance(item, dict) and "proxy" not in item:
+                item = dict(item)
+                item["proxy"] = ""
+            self.visits.append(PageVisit(**item))
         self.discovered_via_source = {
             (item[0], item[1], item[2]) for item in payload.get("discovered_via_source", [])
         }
@@ -618,12 +866,12 @@ class SiteCrawler:
         if requeued_count > 0:
             self.logger.info("Requeued discovered URLs after checkpoint restore count=%s frontier=%s", requeued_count, len(self.frontier))
 
-    def _initialize_from_seed_urls(self, seed_urls: list[str]) -> None:
+    def _initialize_from_seed_urls(self, seed_urls: List[str]) -> None:
         for seed_url in seed_urls:
             self.enqueue_url(seed_url, depth=0, source_url=seed_url, method="seed")
         self.save_checkpoint(force=True, completed=False)
 
-    def _merge_new_seed_urls(self, seed_urls: list[str]) -> None:
+    def _merge_new_seed_urls(self, seed_urls: List[str]) -> None:
         before_frontier = len(self.frontier)
         for seed_url in seed_urls:
             self.enqueue_url(seed_url, depth=0, source_url=seed_url, method="seed")
@@ -662,7 +910,7 @@ class SiteCrawler:
             requeued += 1
         return requeued
 
-    def normalize_url(self, raw_url: str, base_url: str | None = None) -> str | None:
+    def normalize_url(self, raw_url: str, base_url: Optional[str] = None) -> Optional[str]:
         if not raw_url:
             return None
         candidate = raw_url.strip()
@@ -844,9 +1092,9 @@ class SiteCrawler:
         content_id: Any,
         year: Any = None,
         issue: Any = None,
-        title: str | None = None,
+        title: Optional[str] = None,
         english: bool = False,
-    ) -> str | None:
+    ) -> Optional[str]:
         if not self.is_ajcass or content_id in (None, ""):
             return None
 
@@ -875,7 +1123,7 @@ class SiteCrawler:
             params.append(("year", year))
         return f"{self.site_origin}/#/issue?{urlencode(params, doseq=True)}"
 
-    def register_url(self, raw_url: str, source_url: str, depth: int, method: str, note: str = "") -> str | None:
+    def register_url(self, raw_url: str, source_url: str, depth: int, method: str, note: str = "") -> Optional[str]:
         normalized = self.normalize_url(raw_url, base_url=source_url)
         if not normalized:
             return None
@@ -922,7 +1170,7 @@ class SiteCrawler:
             self.expected_static_detail_urls.add(normalized)
         return normalized
 
-    def enqueue_url(self, raw_url: str, depth: int, source_url: str, method: str, note: str = "") -> str | None:
+    def enqueue_url(self, raw_url: str, depth: int, source_url: str, method: str, note: str = "") -> Optional[str]:
         normalized = self.register_url(raw_url, source_url, depth, method, note=note)
         if not normalized:
             return None
@@ -1142,7 +1390,7 @@ class SiteCrawler:
             remaining = max(0, remaining - current_limit)
         return found
 
-    def clean_extracted_url_candidate(self, candidate: str) -> str | None:
+    def clean_extracted_url_candidate(self, candidate: str) -> Optional[str]:
         value = candidate.strip()
         if not value:
             return None
@@ -1200,12 +1448,12 @@ class SiteCrawler:
 
     def parse_ajcass_issue_items(
         self,
-        items: list[dict[str, Any]] | None,
+        items: Optional[List[Dict[str, Any]]],
         method: str,
         *,
         english: bool = False,
-    ) -> list[tuple[str, str]]:
-        found: list[tuple[str, str]] = []
+    ) -> List[Tuple[str, str]]:
+        found: List[Tuple[str, str]] = []
         if not items:
             return found
         for item in items:
@@ -1237,8 +1485,8 @@ class SiteCrawler:
                     found.append((value, f"{method}:{key}"))
         return found
 
-    async def parse_paginated_site_content(self, source_url: str, depth: int, payload: dict[str, Any], total_pages: int) -> list[tuple[str, str]]:
-        found: list[tuple[str, str]] = []
+    async def parse_paginated_site_content(self, source_url: str, depth: int, payload: Dict[str, Any], total_pages: int, api_context: Any) -> List[Tuple[str, str]]:
+        found: List[Tuple[str, str]] = []
         current = int(payload.get("curr", 1))
         page_numbers = list(range(current + 1, total_pages + 1))
         if self.config.max_api_pages_per_series:
@@ -1250,13 +1498,13 @@ class SiteCrawler:
             if fetch_key in self.fetched_api_pages:
                 continue
             self.fetched_api_pages.add(fetch_key)
-            response = await self.api_context.post(AJCASS_SITE_CONTENT_API, data=next_payload)
+            response = await api_context.post(AJCASS_SITE_CONTENT_API, data=next_payload)
             data = await response.json()
-            found.extend(await self.parse_site_content_response(data, next_payload, source_url, depth, allow_pagination=False))
+            found.extend(await self.parse_site_content_response(data, next_payload, source_url, depth, api_context, allow_pagination=False))
         return found
 
-    async def parse_paginated_issue_search(self, source_url: str, depth: int, payload: dict[str, Any], total_pages: int) -> list[tuple[str, str]]:
-        found: list[tuple[str, str]] = []
+    async def parse_paginated_issue_search(self, source_url: str, depth: int, payload: Dict[str, Any], total_pages: int, api_context: Any) -> List[Tuple[str, str]]:
+        found: List[Tuple[str, str]] = []
         current = int(payload.get("curr", 1))
         page_numbers = list(range(current + 1, total_pages + 1))
         if self.config.max_api_pages_per_series:
@@ -1268,13 +1516,13 @@ class SiteCrawler:
             if fetch_key in self.fetched_api_pages:
                 continue
             self.fetched_api_pages.add(fetch_key)
-            response = await self.api_context.post(AJCASS_ISSUE_SEARCH_API, data=next_payload)
+            response = await api_context.post(AJCASS_ISSUE_SEARCH_API, data=next_payload)
             data = await response.json()
-            found.extend(await self.parse_issue_search_response(data, next_payload, source_url, depth, allow_pagination=False))
+            found.extend(await self.parse_issue_search_response(data, next_payload, source_url, depth, api_context, allow_pagination=False))
         return found
 
-    async def parse_paginated_issue_simple_search(self, source_url: str, depth: int, payload: dict[str, Any], total_pages: int) -> list[tuple[str, str]]:
-        found: list[tuple[str, str]] = []
+    async def parse_paginated_issue_simple_search(self, source_url: str, depth: int, payload: Dict[str, Any], total_pages: int, api_context: Any) -> List[Tuple[str, str]]:
+        found: List[Tuple[str, str]] = []
         current = int(payload.get("curr", 1))
         page_numbers = list(range(current + 1, total_pages + 1))
         if self.config.max_api_pages_per_series:
@@ -1286,20 +1534,21 @@ class SiteCrawler:
             if fetch_key in self.fetched_api_pages:
                 continue
             self.fetched_api_pages.add(fetch_key)
-            response = await self.api_context.post(AJCASS_ISSUE_SIMPLE_API, data=next_payload)
+            response = await api_context.post(AJCASS_ISSUE_SIMPLE_API, data=next_payload)
             data = await response.json()
-            found.extend(await self.parse_issue_simple_response(data, next_payload, source_url, depth, allow_pagination=False))
+            found.extend(await self.parse_issue_simple_response(data, next_payload, source_url, depth, api_context, allow_pagination=False))
         return found
 
     async def parse_site_content_response(
         self,
-        data: dict[str, Any],
-        payload: dict[str, Any],
+        data: Dict[str, Any],
+        payload: Dict[str, Any],
         source_url: str,
         depth: int,
+        api_context: Any,
         allow_pagination: bool = True,
-    ) -> list[tuple[str, str]]:
-        found: list[tuple[str, str]] = []
+    ) -> List[Tuple[str, str]]:
+        found: List[Tuple[str, str]] = []
         channel_id = str(payload.get("channeID", ""))
         for item in data.get("data") or []:
             link_url = str(item.get("linkUrl") or "").strip()
@@ -1331,31 +1580,33 @@ class SiteCrawler:
 
         total_pages = int(data.get("totalpage") or 1)
         if allow_pagination and total_pages > int(payload.get("curr", 1)):
-            found.extend(await self.parse_paginated_site_content(source_url, depth, payload, total_pages))
+            found.extend(await self.parse_paginated_site_content(source_url, depth, payload, total_pages, api_context))
         return found
 
     async def parse_issue_search_response(
         self,
-        data: dict[str, Any],
-        payload: dict[str, Any],
+        data: Dict[str, Any],
+        payload: Dict[str, Any],
         source_url: str,
         depth: int,
+        api_context: Any,
         allow_pagination: bool = True,
-    ) -> list[tuple[str, str]]:
+    ) -> List[Tuple[str, str]]:
         found = self.parse_ajcass_issue_items(data.get("data") or [], "api:GetIssueNormalSearch:issueDetail")
         total_pages = int(data.get("totalpage") or 1)
         if allow_pagination and total_pages > int(payload.get("curr", 1)):
-            found.extend(await self.parse_paginated_issue_search(source_url, depth, payload, total_pages))
+            found.extend(await self.parse_paginated_issue_search(source_url, depth, payload, total_pages, api_context))
         return found
 
     async def parse_issue_simple_response(
         self,
-        data: dict[str, Any],
-        payload: dict[str, Any],
+        data: Dict[str, Any],
+        payload: Dict[str, Any],
         source_url: str,
         depth: int,
+        api_context: Any,
         allow_pagination: bool = True,
-    ) -> list[tuple[str, str]]:
+    ) -> List[Tuple[str, str]]:
         found = self.parse_ajcass_issue_items(
             data.get("data") or [],
             "api:GetIssueSimpleSearch:enIssue",
@@ -1363,13 +1614,13 @@ class SiteCrawler:
         )
         total_pages = int(data.get("totalpage") or 1)
         if allow_pagination and total_pages > int(payload.get("curr", 1)):
-            found.extend(await self.parse_paginated_issue_simple_search(source_url, depth, payload, total_pages))
+            found.extend(await self.parse_paginated_issue_simple_search(source_url, depth, payload, total_pages, api_context))
         return found
 
-    def parse_current_issue_tree(self, data: dict[str, Any]) -> list[tuple[str, str]]:
-        found: list[tuple[str, str]] = []
+    def parse_current_issue_tree(self, data: Dict[str, Any]) -> List[Tuple[str, str]]:
+        found: List[Tuple[str, str]] = []
 
-        def walk_channels(channels: list[dict[str, Any]] | None) -> None:
+        def walk_channels(channels: Optional[List[Dict[str, Any]]]) -> None:
             if not channels:
                 return
             for channel in channels:
@@ -1402,8 +1653,8 @@ class SiteCrawler:
         walk_channels(issue_data.get("channels"))
         return found
 
-    def parse_year_volume_tree(self, data: dict[str, Any]) -> list[tuple[str, str]]:
-        found: list[tuple[str, str]] = []
+    def parse_year_volume_tree(self, data: Dict[str, Any]) -> List[Tuple[str, str]]:
+        found: List[Tuple[str, str]] = []
         if not self.has_ajcass_route("/search"):
             return found
         for year_item in data.get("data") or []:
@@ -1418,8 +1669,8 @@ class SiteCrawler:
                     found.append((search_url, "api:GetYearVolumeTree:search"))
         return found
 
-    def parse_content_info(self, data: dict[str, Any]) -> list[tuple[str, str]]:
-        found: list[tuple[str, str]] = []
+    def parse_content_info(self, data: Dict[str, Any]) -> List[Tuple[str, str]]:
+        found: List[Tuple[str, str]] = []
         payload = data.get("data") or {}
         for key in ("siteContentInfoResult", "issueContentInfoResult", "bmpVideoCourseResult"):
             item = payload.get(key)
@@ -1432,7 +1683,7 @@ class SiteCrawler:
             found.extend((url, "api:GetContentInfo:inline") for url in self.iter_string_urls(item))
         return found
 
-    async def parse_script_response(self, response: Response) -> list[tuple[str, str]]:
+    async def parse_script_response(self, response: Response) -> List[Tuple[str, str]]:
         if not self.is_ajcass or response.url in self.processed_script_requests:
             return []
         self.processed_script_requests.add(response.url)
@@ -1442,14 +1693,14 @@ class SiteCrawler:
             self.logger.warning("Failed to read script response url=%s error=%s", response.url, exc)
             return []
 
-        found: list[tuple[str, str]] = []
+        found: List[Tuple[str, str]] = []
         for route in AJCASS_SCRIPT_ROUTE_CANDIDATES:
             if f'"{route}"' in text or f"'{route}'" in text:
                 self.ajcass_known_routes.add(route)
                 found.append((f"{self.site_origin}/#{route}", "response:script:route"))
         return found
 
-    async def parse_json_response(self, response: Response, source_url: str, depth: int, page_kind: str) -> list[tuple[str, str]]:
+    async def parse_json_response(self, response: Response, source_url: str, depth: int, page_kind: str, api_context: Any) -> List[Tuple[str, str]]:
         url = response.url
         request = response.request
         api_key = f"{url}|{request.method}|{request.post_data or ''}"
@@ -1463,7 +1714,7 @@ class SiteCrawler:
             self.logger.warning("Failed to parse JSON response url=%s error=%s", url, exc)
             return []
 
-        found: list[tuple[str, str]] = []
+        found: List[Tuple[str, str]] = []
         if self.is_ajcass:
             if "GetYearVolumeTree" in url:
                 found.extend(self.parse_year_volume_tree(data))
@@ -1486,21 +1737,21 @@ class SiteCrawler:
                     payload = request.post_data_json or {}
                 except Exception:
                     payload = {}
-                found.extend(await self.parse_site_content_response(data, payload, source_url, depth))
+                found.extend(await self.parse_site_content_response(data, payload, source_url, depth, api_context))
             elif "GetIssueNormalSearch" in url:
                 payload = {}
                 try:
                     payload = request.post_data_json or {}
                 except Exception:
                     payload = {}
-                found.extend(await self.parse_issue_search_response(data, payload, source_url, depth))
+                found.extend(await self.parse_issue_search_response(data, payload, source_url, depth, api_context))
             elif "GetIssueSimpleSearch" in url:
                 payload = {}
                 try:
                     payload = request.post_data_json or {}
                 except Exception:
                     payload = {}
-                found.extend(await self.parse_issue_simple_response(data, payload, source_url, depth))
+                found.extend(await self.parse_issue_simple_response(data, payload, source_url, depth, api_context))
             elif "GetIssueinfoList" in url:
                 found.extend(self.parse_ajcass_issue_items(data.get("data") or [], "api:GetIssueinfoList:issueDetail"))
             elif "GetContentInfo" in url:
@@ -1508,19 +1759,19 @@ class SiteCrawler:
         found.extend((url_candidate, "response:json") for url_candidate in self.iter_string_urls(data))
         return found
 
-    async def parse_response(self, response: Response, source_url: str, depth: int, page_kind: str) -> list[tuple[str, str]]:
+    async def parse_response(self, response: Response, source_url: str, depth: int, page_kind: str, api_context: Any) -> List[Tuple[str, str]]:
         content_type = response.headers.get("content-type", "").lower()
         if "application/json" in content_type or "+json" in content_type:
-            return await self.parse_json_response(response, source_url, depth, page_kind)
+            return await self.parse_json_response(response, source_url, depth, page_kind, api_context)
         if self.is_ajcass and ("javascript" in content_type or response.url.lower().endswith(".js")):
             return await self.parse_script_response(response)
         return []
 
     async def process_page(self, item: QueueItem) -> None:
-        if self.context is None:
-            raise RuntimeError("Browser context is not initialized.")
-
-        page = await self.context.new_page()
+        session = self.get_next_session()
+        page = await session.context.new_page()
+        if self.config.enable_request_blocking:
+            await page.route("**/*", self.handle_route)
         response_tasks: list[tuple[str, asyncio.Task[list[tuple[str, str]]]]] = []
         discoveries: list[tuple[str, str]] = []
         visit = PageVisit(
@@ -1528,14 +1779,16 @@ class SiteCrawler:
             final_url=item.url,
             depth=item.depth,
             page_kind=self.page_kind(item.url),
+            proxy=session.proxy_label,
             title="",
             ok=False,
             started_at=time.time(),
         )
         self.logger.info(
-            "Visit start depth=%s kind=%s from=%s method=%s url=%s",
+            "Visit start depth=%s kind=%s proxy=%s from=%s method=%s url=%s",
             item.depth,
             visit.page_kind,
+            visit.proxy,
             item.discovered_from,
             item.discovery_method,
             item.url,
@@ -1560,6 +1813,7 @@ class SiteCrawler:
                             source_url=item.url,
                             depth=item.depth + 1,
                             page_kind=self.page_kind(item.url),
+                            api_context=session.api_context,
                         )
                     ),
                 )
@@ -1640,9 +1894,10 @@ class SiteCrawler:
             self.visited_urls.add(item.url)
             if visit.ok:
                 self.logger.info(
-                    "Visit ok depth=%s final_kind=%s discoveries=%s duration_ms=%s requested=%s final=%s title=%s",
+                    "Visit ok depth=%s final_kind=%s proxy=%s discoveries=%s duration_ms=%s requested=%s final=%s title=%s",
                     item.depth,
                     visit.page_kind,
+                    visit.proxy,
                     visit.discoveries,
                     visit.duration_ms,
                     item.url,
@@ -1740,6 +1995,7 @@ class SiteCrawler:
         missing_issue_detail = sorted(self.expected_issue_detail_urls - queueable_discovered)
         missing_static_detail = sorted(self.expected_static_detail_urls - queueable_discovered)
         missing_en_issue = sorted(self.expected_en_issue_urls - queueable_discovered)
+        proxy_session_count = len(self.sessions) if self.sessions else len(self.build_session_proxies())
 
         return {
             "site_key": self.config.site_key,
@@ -1765,6 +2021,9 @@ class SiteCrawler:
             "site_features": {
                 "ajcass_known_routes": sorted(self.ajcass_known_routes),
                 "ajcass_issue_route": self.ajcass_issue_route if self.is_ajcass else "",
+                "proxy_servers_count": len(self.config.proxy_servers),
+                "proxy_session_count": proxy_session_count,
+                "skip_failed_proxies": self.config.skip_failed_proxies,
             },
             "verification": {
                 "expected_issue_search_urls": len(self.expected_issue_search_urls),
@@ -1827,6 +2086,7 @@ class SiteCrawler:
                 "final_url",
                 "depth",
                 "page_kind",
+                "proxy",
                 "title",
                 "ok",
                 "error",
@@ -1846,7 +2106,7 @@ class SiteCrawler:
         atomic_write_text(self.external_urls_path, "\n".join(external_urls) + ("\n" if external_urls else ""))
         atomic_write_text(self.seed_urls_path, "\n".join(self.config.seed_urls) + ("\n" if self.config.seed_urls else ""))
 
-    def save_checkpoint(self, force: bool = False, completed: bool | None = None) -> None:
+    def save_checkpoint(self, force: bool = False, completed: Optional[bool] = None) -> None:
         if completed is not None:
             self.completed = completed
         now = time.time()
@@ -1895,7 +2155,7 @@ class SiteCrawler:
 
 
 class BatchRunner:
-    def __init__(self, config_path: str | Path = DEFAULT_CONFIG_PATH) -> None:
+    def __init__(self, config_path: Union[str, Path] = DEFAULT_CONFIG_PATH) -> None:
         self.config_path = Path(config_path)
         self.batch_config = BatchConfig.from_file(self.config_path)
         self.output_root = Path(self.batch_config.output_root)
@@ -1946,6 +2206,13 @@ class BatchRunner:
                     enable_generic_interactions=self.batch_config.enable_generic_interactions,
                     max_interaction_clicks_per_page=self.batch_config.max_interaction_clicks_per_page,
                     max_api_pages_per_series=self.batch_config.max_api_pages_per_series,
+                    proxy_servers=self.batch_config.proxy_servers,
+                    proxy_session_count=self.batch_config.proxy_session_count,
+                    skip_failed_proxies=self.batch_config.skip_failed_proxies,
+                    browser_launch_args=self.batch_config.browser_launch_args,
+                    enable_request_blocking=self.batch_config.enable_request_blocking,
+                    blocked_resource_types=self.batch_config.blocked_resource_types,
+                    blocked_url_suffixes=self.batch_config.blocked_url_suffixes,
                 )
             )
         self.logger.info("Built site configs count=%s input_path=%s", len(site_configs), input_path)
@@ -2144,7 +2411,8 @@ class BatchRunner:
 
 
 async def async_main(config_path: str = DEFAULT_CONFIG_PATH) -> int:
-    runner = BatchRunner(config_path=config_path)
+    resolved_config_path = os.environ.get("CRAWLER_CONFIG_PATH", config_path)
+    runner = BatchRunner(config_path=resolved_config_path)
     summary = await runner.run()
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0

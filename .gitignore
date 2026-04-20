@@ -8,5 +8,6 @@ crawl_output*/
 *.log
 *.tmp
 .DS_Store
+config.server.json
 
 CLAUDE.md

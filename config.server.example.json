@@ -1,13 +1,13 @@
 {
   "input_urls_file": "input_urls.txt",
-  "output_root": "crawl_output_batch",
+  "output_root": "/opt/huawei/data2/w00943222/spider/output",
   "chromium_executable_path": "",
   "log_level": "INFO",
   "log_to_file": true,
   "headless": true,
   "max_concurrency": 8,
-  "page_timeout_ms": 20000,
-  "settle_ms": 900,
+  "page_timeout_ms": 30000,
+  "settle_ms": 1500,
   "max_pages_per_site": 0,
   "checkpoint_every_pages": 10,
   "checkpoint_every_seconds": 30,
@@ -17,14 +17,25 @@
   "enable_generic_interactions": true,
   "max_interaction_clicks_per_page": 18,
   "max_api_pages_per_series": 0,
-  "proxy_servers": [],
-  "proxy_session_count": 0,
+  "proxy_session_count": 8,
   "skip_failed_proxies": true,
+  "proxy_servers": [
+    "http://proxy-ip-1:port",
+    "http://proxy-ip-2:port",
+    {
+      "server": "http://proxy-ip-3:port",
+      "username": "optional-user",
+      "password": "optional-password",
+      "label": "proxy-3"
+    }
+  ],
   "browser_launch_args": [
     "--disable-blink-features=AutomationControlled",
     "--disable-gpu",
     "--disable-dev-shm-usage",
-    "--incognito"
+    "--incognito",
+    "--no-sandbox",
+    "--disable-setuid-sandbox"
   ],
   "enable_request_blocking": true,
   "blocked_resource_types": [
@@ -34,22 +45,17 @@
     "ping"
   ],
   "blocked_url_suffixes": [
-    ".bmp",
-    ".eot",
-    ".gif",
-    ".ico",
-    ".jpeg",
-    ".jpg",
     ".m4s",
-    ".mp3",
-    ".mp4",
+    ".jpg",
+    ".jpeg",
     ".png",
-    ".svg",
-    ".ttf",
-    ".wav",
-    ".webm",
+    ".gif",
+    ".bmp",
     ".webp",
+    ".svg",
+    ".ico",
     ".woff",
-    ".woff2"
+    ".woff2",
+    ".ttf"
   ]
 }
