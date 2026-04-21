@@ -11,10 +11,10 @@ import os
 import re
 import time
 import traceback
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple, Union
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from playwright.async_api import (
@@ -255,11 +255,13 @@ class BatchConfig:
     log_to_file: bool = True
     headless: bool = True
     max_concurrency: int = 8
+    max_site_concurrency: int = 1
     page_timeout_ms: int = 20000
     settle_ms: int = 900
     max_pages_per_site: int = 0
     checkpoint_every_pages: int = 10
     checkpoint_every_seconds: int = 30
+    write_full_outputs_on_checkpoint: bool = True
     skip_completed_sites: bool = True
     visit_leaf_pages: bool = True
     include_site_homepage_seed: bool = True
@@ -288,11 +290,13 @@ class BatchConfig:
             log_to_file=bool(payload.get("log_to_file", True)),
             headless=bool(payload.get("headless", True)),
             max_concurrency=int(payload.get("max_concurrency", 8)),
+            max_site_concurrency=max(1, int(payload.get("max_site_concurrency", 1))),
             page_timeout_ms=int(payload.get("page_timeout_ms", 20000)),
             settle_ms=int(payload.get("settle_ms", 900)),
             max_pages_per_site=int(payload.get("max_pages_per_site", 0)),
             checkpoint_every_pages=max(1, int(payload.get("checkpoint_every_pages", 10))),
             checkpoint_every_seconds=max(1, int(payload.get("checkpoint_every_seconds", 30))),
+            write_full_outputs_on_checkpoint=bool(payload.get("write_full_outputs_on_checkpoint", True)),
             skip_completed_sites=bool(payload.get("skip_completed_sites", True)),
             visit_leaf_pages=bool(payload.get("visit_leaf_pages", True)),
             include_site_homepage_seed=bool(payload.get("include_site_homepage_seed", True)),
@@ -328,6 +332,7 @@ class SiteConfig:
     page_limit: int
     checkpoint_every_pages: int
     checkpoint_every_seconds: int
+    write_full_outputs_on_checkpoint: bool
     visit_leaf_pages: bool
     enable_generic_interactions: bool
     max_interaction_clicks_per_page: int
@@ -607,7 +612,7 @@ def group_urls_by_site(urls: List[str], include_homepage_seed: bool) -> Dict[str
 
 
 class SiteCrawler:
-    def __init__(self, config: SiteConfig) -> None:
+    def __init__(self, config: SiteConfig, shared_playwright: Optional[Playwright] = None) -> None:
         self.config = config
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
         self.site_host = config.site_host
@@ -620,14 +625,17 @@ class SiteCrawler:
             log_file=(self.config.output_dir / "crawl.log") if self.config.log_to_file else None,
         )
 
+        self.shared_playwright = shared_playwright
         self.playwright: Optional[Playwright] = None
+        self.owns_playwright = False
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
         self.api_context = None
         self.sessions: List[CrawlerSession] = []
         self.session_index = 0
 
-        self.frontier: List[QueueItem] = []
+        self.frontier: Deque[QueueItem] = deque()
+        self.active_queue_items: Dict[str, QueueItem] = {}
         self.discovered_urls: Dict[str, Dict[str, Any]] = {}
         self.visited_urls: Set[str] = set()
         self.queued_urls: Set[str] = set()
@@ -680,7 +688,12 @@ class SiteCrawler:
         )
 
     async def __aenter__(self) -> "SiteCrawler":
-        self.playwright = await async_playwright().start()
+        if self.shared_playwright is not None:
+            self.playwright = self.shared_playwright
+            self.owns_playwright = False
+        else:
+            self.playwright = await async_playwright().start()
+            self.owns_playwright = True
         session_proxies = self.build_session_proxies()
         self.logger.info(
             "Launching crawler sessions count=%s proxies=%s headless=%s chromium_executable_path=%s",
@@ -752,7 +765,7 @@ class SiteCrawler:
                 await session.context.close()
             if session.browser is not None:
                 await session.browser.close()
-        if self.playwright is not None:
+        if self.playwright is not None and self.owns_playwright:
             await self.playwright.stop()
         self.sessions = []
         self.logger.info("Browser resources closed site=%s", self.config.site_key)
@@ -805,6 +818,15 @@ class SiteCrawler:
         self.session_index += 1
         return session
 
+    def frontier_count(self) -> int:
+        return len(self.frontier) + len(self.active_queue_items)
+
+    def checkpoint_frontier_items(self) -> List[QueueItem]:
+        combined: Dict[str, QueueItem] = {}
+        for item in list(self.active_queue_items.values()) + list(self.frontier):
+            combined[item.url] = item
+        return list(combined.values())
+
     async def handle_route(self, route) -> None:
         request = route.request
         request_url = request.url.lower()
@@ -851,7 +873,8 @@ class SiteCrawler:
     def _load_from_checkpoint(self, payload: Dict[str, Any]) -> None:
         original_frontier_count = len(payload.get("frontier", []))
         policy_matches = checkpoint_matches_current_policy(payload, self.config.visit_leaf_pages)
-        self.frontier = [QueueItem(**item) for item in payload.get("frontier", [])]
+        self.frontier = deque(QueueItem(**item) for item in payload.get("frontier", []))
+        self.active_queue_items = {}
         self.discovered_urls = {
             item["url"]: item for item in payload.get("discovered_urls", [])
         }
@@ -887,11 +910,11 @@ class SiteCrawler:
                 self.config.visit_leaf_pages,
             )
         self._refresh_discovered_node_metadata()
-        self.frontier = [
+        self.frontier = deque(
             item
             for item in self.frontier
             if item.url not in self.visited_urls and self.should_visit_url(item.url)
-        ]
+        )
         filtered_count = original_frontier_count - len(self.frontier)
         if filtered_count > 0:
             self.logger.info(
@@ -2272,67 +2295,85 @@ class SiteCrawler:
                     visit.final_url,
                     truncate_text(visit.title),
                 )
-            await page.close()
+            try:
+                await page.close()
+            except Exception:
+                self.logger.debug("Failed to close page requested=%s final=%s", item.url, visit.final_url, exc_info=True)
 
     async def crawl(self) -> dict[str, Any]:
         processed_pages = 0
         hit_page_limit = False
-        batch_index = 0
+        active_tasks: Dict[asyncio.Task[None], QueueItem] = {}
         self.logger.info(
             "Crawl start site=%s frontier=%s visited=%s discovered=%s page_limit=%s concurrency=%s",
             self.config.site_key,
-            len(self.frontier),
+            self.frontier_count(),
             len(self.visited_urls),
             len(self.discovered_urls),
             self.config.page_limit,
             self.config.max_concurrency,
         )
-        while self.frontier:
-            if self.config.page_limit and processed_pages >= self.config.page_limit:
-                hit_page_limit = True
-                self.logger.info(
-                    "Hit page limit site=%s page_limit=%s processed_pages=%s frontier_remaining=%s",
+        while self.frontier or active_tasks:
+            while self.frontier and len(active_tasks) < self.config.max_concurrency:
+                if self.config.page_limit and processed_pages >= self.config.page_limit:
+                    if not hit_page_limit:
+                        hit_page_limit = True
+                        self.logger.info(
+                            "Hit page limit site=%s page_limit=%s processed_pages=%s frontier_remaining=%s active=%s",
+                            self.config.site_key,
+                            self.config.page_limit,
+                            processed_pages,
+                            len(self.frontier),
+                            len(active_tasks),
+                        )
+                    break
+                item = self.frontier.popleft()
+                self.active_queue_items[item.url] = item
+                active_tasks[asyncio.create_task(self.process_page(item))] = item
+                processed_pages += 1
+                self.logger.debug(
+                    "Dispatched URL site=%s processed=%s active=%s frontier=%s url=%s",
                     self.config.site_key,
-                    self.config.page_limit,
                     processed_pages,
+                    len(active_tasks),
                     len(self.frontier),
+                    item.url,
                 )
+
+            if not active_tasks:
                 break
-            batch = self.frontier[: self.config.max_concurrency]
-            self.frontier = self.frontier[self.config.max_concurrency :]
-            batch_index += 1
-            batch_visited_before = len(self.visits)
+
+            visits_before = len(self.visits)
+            done, _ = await asyncio.wait(active_tasks.keys(), return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                item = active_tasks.pop(task)
+                self.active_queue_items.pop(item.url, None)
+                try:
+                    await task
+                except Exception:
+                    self.logger.exception("Crawler worker crashed site=%s url=%s", self.config.site_key, item.url)
+            completed_count = len(done)
+            self.pages_since_checkpoint += completed_count
+            new_visits = self.visits[visits_before:]
+            completed_ok = sum(1 for visit in new_visits if visit.ok)
+            completed_failed = len(new_visits) - completed_ok
             self.logger.info(
-                "Batch start site=%s batch=%s size=%s frontier_remaining=%s visited=%s discovered=%s",
+                "Worker tick site=%s finished=%s ok=%s failed=%s active=%s frontier=%s visited=%s discovered=%s",
                 self.config.site_key,
-                batch_index,
-                len(batch),
+                completed_count,
+                completed_ok,
+                completed_failed,
+                len(active_tasks),
                 len(self.frontier),
                 len(self.visited_urls),
                 len(self.discovered_urls),
-            )
-            await asyncio.gather(*(self.process_page(item) for item in batch))
-            processed_pages += len(batch)
-            self.pages_since_checkpoint += len(batch)
-            new_visits = self.visits[batch_visited_before:]
-            batch_ok = sum(1 for visit in new_visits if visit.ok)
-            batch_failed = len(new_visits) - batch_ok
-            self.logger.info(
-                "Batch end site=%s batch=%s ok=%s failed=%s total_visited=%s discovered=%s frontier=%s",
-                self.config.site_key,
-                batch_index,
-                batch_ok,
-                batch_failed,
-                len(self.visited_urls),
-                len(self.discovered_urls),
-                len(self.frontier),
             )
             self.save_checkpoint()
 
-        self.completed = not self.frontier and not hit_page_limit
+        self.completed = not self.frontier and not self.active_queue_items and not hit_page_limit
         summary = self.build_summary()
-        self.write_outputs(summary)
-        self.save_checkpoint(force=True, completed=self.completed)
+        self.write_outputs(summary, include_detail_files=True)
+        self.save_checkpoint(force=True, completed=self.completed, include_detail_files=False)
         self.logger.info(
             "Crawl finished site=%s completed=%s discovered=%s queueable=%s visited=%s failed=%s summary=%s",
             self.config.site_key,
@@ -2392,6 +2433,8 @@ class SiteCrawler:
                 "proxy_servers_count": len(self.config.proxy_servers),
                 "proxy_session_count": proxy_session_count,
                 "skip_failed_proxies": self.config.skip_failed_proxies,
+                "max_concurrency": self.config.max_concurrency,
+                "write_full_outputs_on_checkpoint": self.config.write_full_outputs_on_checkpoint,
                 "enable_cbpt_portal_ajax_expansion": self.config.enable_cbpt_portal_ajax_expansion,
                 "max_cbpt_portal_ajax_requests_per_page": self.config.max_cbpt_portal_ajax_requests_per_page,
             },
@@ -2412,14 +2455,20 @@ class SiteCrawler:
                 "unvisited_queueable_urls_sample": sample(unvisited_queueable),
                 "intentionally_skipped_leaf_urls_count": len(skipped_leaf_urls),
                 "intentionally_skipped_leaf_urls_sample": sample(skipped_leaf_urls),
-                "remaining_frontier_count": len(self.frontier),
+                "frontier_queue_count": len(self.frontier),
+                "active_pages_count": len(self.active_queue_items),
+                "remaining_frontier_count": self.frontier_count(),
             },
         }
 
-    def write_outputs(self, summary: dict[str, Any]) -> None:
+    def write_outputs(self, summary: dict[str, Any], include_detail_files: bool = True) -> None:
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
 
         atomic_write_text(self.summary_path, json.dumps(summary, ensure_ascii=False, indent=2))
+        atomic_write_text(self.seed_urls_path, "\n".join(self.config.seed_urls) + ("\n" if self.config.seed_urls else ""))
+
+        if not include_detail_files:
+            return
 
         node_lines = [
             json.dumps(self.discovered_urls[url], ensure_ascii=False)
@@ -2474,9 +2523,13 @@ class SiteCrawler:
         atomic_write_text(self.all_urls_path, "\n".join(all_urls) + ("\n" if all_urls else ""))
         atomic_write_text(self.same_site_urls_path, "\n".join(same_site_urls) + ("\n" if same_site_urls else ""))
         atomic_write_text(self.external_urls_path, "\n".join(external_urls) + ("\n" if external_urls else ""))
-        atomic_write_text(self.seed_urls_path, "\n".join(self.config.seed_urls) + ("\n" if self.config.seed_urls else ""))
 
-    def save_checkpoint(self, force: bool = False, completed: Optional[bool] = None) -> None:
+    def save_checkpoint(
+        self,
+        force: bool = False,
+        completed: Optional[bool] = None,
+        include_detail_files: Optional[bool] = None,
+    ) -> None:
         if completed is not None:
             self.completed = completed
         now = time.time()
@@ -2485,7 +2538,9 @@ class SiteCrawler:
                 return
 
         summary = self.build_summary()
-        self.write_outputs(summary)
+        if include_detail_files is None:
+            include_detail_files = self.config.write_full_outputs_on_checkpoint
+        self.write_outputs(summary, include_detail_files=include_detail_files)
         payload = {
             "site_key": self.config.site_key,
             "site_host": self.site_host,
@@ -2494,7 +2549,7 @@ class SiteCrawler:
             "visit_leaf_pages": self.config.visit_leaf_pages,
             "seed_urls": self.config.seed_urls,
             "completed": self.completed,
-            "frontier": [asdict(item) for item in self.frontier],
+            "frontier": [asdict(item) for item in self.checkpoint_frontier_items()],
             "discovered_urls": [self.discovered_urls[url] for url in sorted(self.discovered_urls)],
             "visited_urls": sorted(self.visited_urls),
             "queued_urls": sorted(self.queued_urls),
@@ -2515,11 +2570,13 @@ class SiteCrawler:
         self.pages_since_checkpoint = 0
         self.last_checkpoint_at = now
         self.logger.info(
-            "Checkpoint saved completed=%s discovered=%s visited=%s frontier=%s path=%s",
+            "Checkpoint saved completed=%s discovered=%s visited=%s frontier=%s active=%s detail_files=%s path=%s",
             self.completed,
             len(self.discovered_urls),
             len(self.visited_urls),
             len(self.frontier),
+            len(self.active_queue_items),
+            include_detail_files,
             self.checkpoint_path,
         )
 
@@ -2538,11 +2595,13 @@ class BatchRunner:
             log_file=(self.output_root / "batch.log") if self.batch_config.log_to_file else None,
         )
         self.logger.info(
-            "Batch runner initialized config=%s output_root=%s log_level=%s chromium_executable_path=%s",
+            "Batch runner initialized config=%s output_root=%s log_level=%s chromium_executable_path=%s max_site_concurrency=%s write_full_outputs_on_checkpoint=%s",
             self.config_path,
             self.output_root,
             self.batch_config.log_level,
             self.batch_config.chromium_executable_path or "<playwright-default>",
+            self.batch_config.max_site_concurrency,
+            self.batch_config.write_full_outputs_on_checkpoint,
         )
 
     def build_site_configs(self) -> list[SiteConfig]:
@@ -2572,6 +2631,7 @@ class BatchRunner:
                     page_limit=self.batch_config.max_pages_per_site,
                     checkpoint_every_pages=self.batch_config.checkpoint_every_pages,
                     checkpoint_every_seconds=self.batch_config.checkpoint_every_seconds,
+                    write_full_outputs_on_checkpoint=self.batch_config.write_full_outputs_on_checkpoint,
                     visit_leaf_pages=self.batch_config.visit_leaf_pages,
                     enable_generic_interactions=self.batch_config.enable_generic_interactions,
                     max_interaction_clicks_per_page=self.batch_config.max_interaction_clicks_per_page,
@@ -2590,75 +2650,135 @@ class BatchRunner:
         self.logger.info("Built site configs count=%s input_path=%s", len(site_configs), input_path)
         return site_configs
 
+    def _load_completed_site_summary_if_skippable(self, site_config: SiteConfig) -> Optional[dict[str, Any]]:
+        checkpoint_path = site_config.output_dir / "checkpoint.json"
+        if not checkpoint_path.exists():
+            return None
+        checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        policy_matches = checkpoint_matches_current_policy(checkpoint, self.batch_config.visit_leaf_pages)
+        if checkpoint.get("completed") and self.batch_config.skip_completed_sites and policy_matches:
+            summary_path = site_config.output_dir / "summary.json"
+            self.logger.info(
+                "Skipping completed site site=%s checkpoint=%s",
+                site_config.site_key,
+                checkpoint_path,
+            )
+            if summary_path.exists():
+                return json.loads(summary_path.read_text(encoding="utf-8"))
+            return {
+                "site_key": site_config.site_key,
+                "site_host": site_config.site_host,
+                "site_origin": site_config.site_origin,
+                "seed_urls": site_config.seed_urls,
+                "completed": True,
+            }
+        if checkpoint.get("completed") and self.batch_config.skip_completed_sites and not policy_matches:
+            self.logger.info(
+                "Checkpoint policy changed; resuming site site=%s checkpoint=%s old_version=%s new_version=%s old_visit_leaf_pages=%s new_visit_leaf_pages=%s",
+                site_config.site_key,
+                checkpoint_path,
+                checkpoint.get("crawl_policy_version", 0),
+                CRAWL_POLICY_VERSION,
+                checkpoint.get("visit_leaf_pages", False),
+                self.batch_config.visit_leaf_pages,
+            )
+        return None
+
+    async def run_site(self, site_config: SiteConfig, shared_playwright: Optional[Playwright] = None) -> dict[str, Any]:
+        site_family = "ajcass" if is_ajcass_host(site_config.site_host) else "cbpt_cnki" if site_config.site_host.endswith(".cbpt.cnki.net") else "generic"
+        try:
+            self.logger.info(
+                "Starting site crawl site=%s family=%s seeds=%s output_dir=%s",
+                site_config.site_key,
+                site_family,
+                len(site_config.seed_urls),
+                site_config.output_dir,
+            )
+            async with SiteCrawler(site_config, shared_playwright=shared_playwright) as crawler:
+                summary = await crawler.crawl()
+                self.logger.info(
+                    "Site crawl finished site=%s completed=%s discovered=%s visited=%s failed=%s",
+                    site_config.site_key,
+                    summary.get("completed", False),
+                    summary.get("counts", {}).get("discovered_urls", 0),
+                    summary.get("counts", {}).get("visited_pages", 0),
+                    summary.get("counts", {}).get("visit_failed", 0),
+                )
+                return summary
+        except Exception:
+            error_summary = {
+                "site_key": site_config.site_key,
+                "site_host": site_config.site_host,
+                "site_origin": site_config.site_origin,
+                "seed_urls": site_config.seed_urls,
+                "completed": False,
+                "error": traceback.format_exc(),
+            }
+            atomic_write_text(site_config.output_dir / "run_error.txt", error_summary["error"])
+            atomic_write_text(site_config.output_dir / "summary.json", json.dumps(error_summary, ensure_ascii=False, indent=2))
+            self.logger.exception("Site crawl failed site=%s output_dir=%s", site_config.site_key, site_config.output_dir)
+            return error_summary
+
     async def run(self) -> dict[str, Any]:
         site_configs = self.build_site_configs()
         batch_results: list[dict[str, Any]] = []
         self.logger.info(
-            "Batch run start sites=%s skip_completed=%s input_urls_file=%s",
+            "Batch run start sites=%s skip_completed=%s input_urls_file=%s max_site_concurrency=%s",
             len(site_configs),
             self.batch_config.skip_completed_sites,
             self.batch_config.input_urls_file,
+            self.batch_config.max_site_concurrency,
         )
-
+        runnable_sites: list[SiteConfig] = []
         for site_config in site_configs:
-            site_family = "ajcass" if is_ajcass_host(site_config.site_host) else "cbpt_cnki" if site_config.site_host.endswith(".cbpt.cnki.net") else "generic"
-            checkpoint_path = site_config.output_dir / "checkpoint.json"
-            if checkpoint_path.exists():
-                checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
-                policy_matches = checkpoint_matches_current_policy(checkpoint, self.batch_config.visit_leaf_pages)
-                if checkpoint.get("completed") and self.batch_config.skip_completed_sites and policy_matches:
-                    summary_path = site_config.output_dir / "summary.json"
-                    self.logger.info(
-                        "Skipping completed site site=%s checkpoint=%s",
-                        site_config.site_key,
-                        checkpoint_path,
-                    )
-                    if summary_path.exists():
-                        batch_results.append(json.loads(summary_path.read_text(encoding="utf-8")))
-                    continue
-                if checkpoint.get("completed") and self.batch_config.skip_completed_sites and not policy_matches:
-                    self.logger.info(
-                        "Checkpoint policy changed; resuming site site=%s checkpoint=%s old_version=%s new_version=%s old_visit_leaf_pages=%s new_visit_leaf_pages=%s",
-                        site_config.site_key,
-                        checkpoint_path,
-                        checkpoint.get("crawl_policy_version", 0),
-                        CRAWL_POLICY_VERSION,
-                        checkpoint.get("visit_leaf_pages", False),
-                        self.batch_config.visit_leaf_pages,
-                    )
+            skipped_summary = self._load_completed_site_summary_if_skippable(site_config)
+            if skipped_summary is not None:
+                batch_results.append(skipped_summary)
+                continue
+            runnable_sites.append(site_config)
 
-            try:
-                self.logger.info(
-                    "Starting site crawl site=%s family=%s seeds=%s output_dir=%s",
-                    site_config.site_key,
-                    site_family,
-                    len(site_config.seed_urls),
-                    site_config.output_dir,
-                )
-                async with SiteCrawler(site_config) as crawler:
-                    summary = await crawler.crawl()
-                    batch_results.append(summary)
+        self.logger.info(
+            "Batch site scheduling runnable=%s skipped=%s max_site_concurrency=%s",
+            len(runnable_sites),
+            len(batch_results),
+            self.batch_config.max_site_concurrency,
+        )
+        shared_playwright = None
+        active_tasks: Dict[asyncio.Task[dict[str, Any]], SiteConfig] = {}
+        try:
+            if runnable_sites:
+                shared_playwright = await async_playwright().start()
+            pending_sites = deque(runnable_sites)
+            while pending_sites or active_tasks:
+                while pending_sites and len(active_tasks) < self.batch_config.max_site_concurrency:
+                    site_config = pending_sites.popleft()
+                    task = asyncio.create_task(self.run_site(site_config, shared_playwright=shared_playwright))
+                    active_tasks[task] = site_config
                     self.logger.info(
-                        "Site crawl finished site=%s completed=%s discovered=%s visited=%s failed=%s",
+                        "Site task dispatched site=%s active_sites=%s pending_sites=%s",
                         site_config.site_key,
-                        summary.get("completed", False),
-                        summary.get("counts", {}).get("discovered_urls", 0),
-                        summary.get("counts", {}).get("visited_pages", 0),
-                        summary.get("counts", {}).get("visit_failed", 0),
+                        len(active_tasks),
+                        len(pending_sites),
                     )
-            except Exception:
-                error_summary = {
-                    "site_key": site_config.site_key,
-                    "site_host": site_config.site_host,
-                    "site_origin": site_config.site_origin,
-                    "seed_urls": site_config.seed_urls,
-                    "completed": False,
-                    "error": traceback.format_exc(),
-                }
-                atomic_write_text(site_config.output_dir / "run_error.txt", error_summary["error"])
-                atomic_write_text(site_config.output_dir / "summary.json", json.dumps(error_summary, ensure_ascii=False, indent=2))
-                batch_results.append(error_summary)
-                self.logger.exception("Site crawl failed site=%s output_dir=%s", site_config.site_key, site_config.output_dir)
+                if not active_tasks:
+                    break
+                done, _ = await asyncio.wait(active_tasks.keys(), return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    site_config = active_tasks.pop(task)
+                    try:
+                        batch_results.append(await task)
+                    except Exception:
+                        self.logger.exception("Site task crashed unexpectedly site=%s", site_config.site_key)
+                    self.logger.info(
+                        "Site task settled site=%s active_sites=%s pending_sites=%s batch_results=%s",
+                        site_config.site_key,
+                        len(active_tasks),
+                        len(pending_sites),
+                        len(batch_results),
+                    )
+        finally:
+            if shared_playwright is not None:
+                await shared_playwright.stop()
 
         batch_summary = self._write_global_outputs(batch_results)
         self.logger.info(

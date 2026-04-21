@@ -25,6 +25,8 @@
 - 外站 URL、下载资源、明显危险动作 URL 只记录，不继续访问。
 - 已访问 URL 不会重复入队，避免死循环。
 - 页面存在交互、弹窗、AJAX 分页时，会尽量展开后继续发现 URL。
+- 高并发模式下支持多站点并行、站内动态 worker 调度、共享 Playwright 驱动。
+- checkpoint 会额外带上“正在跑但尚未落盘”的页面，避免中断时丢失 in-flight URL。
 
 ## 已适配的站点类型
 
@@ -110,6 +112,34 @@ docker run --rm -it \
   ./server_batch_crawler.py
 ```
 
+## 高并发优化
+
+这一版针对“站点很多、需要持续跑批”的场景，核心改动有四个：
+
+- `max_site_concurrency`
+  站点级并发，多个站点可以同时跑，不再串行等待。
+- 站内动态 worker
+  不再按固定 batch 整批等待，而是哪个页面先结束就立刻补下一个，减少慢页拖尾。
+- 轻量 checkpoint
+  `write_full_outputs_on_checkpoint = false` 时，周期性 checkpoint 只刷新 `summary.json` 和 `checkpoint.json`，大幅降低高并发场景下的磁盘写放大。
+- 共享 Playwright
+  批任务级只启动一次 Playwright driver，各站点复用，减少频繁启动浏览器驱动的额外开销。
+
+服务器建议优先从下面这组参数开始调：
+
+- `max_site_concurrency = 4`
+- `max_concurrency = 12`
+- `proxy_session_count = 12`
+- `checkpoint_every_pages = 100`
+- `checkpoint_every_seconds = 180`
+- `write_full_outputs_on_checkpoint = false`
+
+如果目标站更重、代理质量一般，优先降低：
+
+- `max_site_concurrency`
+- `max_concurrency`
+- `max_interaction_clicks_per_page`
+
 ## 配置
 
 本地默认配置文件：[config.json](/D:/Desktop/qoder%20work/config.json)
@@ -126,8 +156,12 @@ docker run --rm -it \
   留空使用 Playwright 默认 Chromium；填写后使用指定浏览器路径。
 - `max_concurrency`
   单站点并发页面数。
+- `max_site_concurrency`
+  站点级并发任务数；服务器上建议大于 `1`。
 - `max_pages_per_site`
   单站点最大访问页数，`0` 表示不限制。
+- `write_full_outputs_on_checkpoint`
+  `true` 时每次 checkpoint 都会重写 `nodes/edges/visits/all_urls` 明细；`false` 时只写 `summary.json + checkpoint.json`，适合高并发服务器。
 - `visit_leaf_pages`
   `true` 表示同站点 HTML 页面默认都访问；`false` 表示保守模式。
 - `enable_generic_interactions`
@@ -223,6 +257,7 @@ python3 server_batch_crawler.py
 - 已访问 URL 不会重复入队。
 - 已完成站点默认会跳过。
 - 当爬取策略版本升级后，旧检查点会自动识别为“需要继续补跑”。
+- 正在访问中的页面也会写入 checkpoint；异常退出后会重新入队，不会因为调度中的页面丢失覆盖。
 
 ## 输出结构
 
@@ -255,6 +290,7 @@ crawl_output_batch/
 - 根目录 `all_discovered_urls.*` 是全局汇总。
 - `sites_summary.csv` 是按站点的汇总表。
 - 站点目录下的 `nodes.*` / `edges.*` / `visits.*` 是单站点明细。
+- 如果 `write_full_outputs_on_checkpoint = false`，运行中途这些明细文件可能不是最新状态；站点本轮结束时会统一刷新完整明细。
 
 ## 日志
 
