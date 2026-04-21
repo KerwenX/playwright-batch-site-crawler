@@ -280,9 +280,9 @@ crawl_output_batch/
 - `paper_list/type_benqi`、`guokan_list?...` 这类论文索引页已能继续向下发现大量论文详情 URL。
 - `onclick` 中的下载、新闻、友情链接、CNKI 跳转 API 已能被抽取。
 - `paperPage_list` / `listPrePaperOrNextPaper` 这类 AJAX 分页已能被主动展开，而不是只靠页面 URL 变化。
-- 本地 60 页快速回归时，已经能发现 `1865` 个 URL，其中 `cbpt_portal_list = 104`、`cbpt_portal_article = 589`。
+- 本地做过 20 页、60 页、180 页三档回归；在较大的快速回归里，`portal` 首页、过刊页、论文列表页和文章页都已经能稳定串起来。
 
-验证输出目录示例：
+最新一次轻量 smoke 输出示例：
 
 - [summary.json](/D:/Desktop/qoder%20work/crawl_output_gggl_test/gggl_cbpt_cnki_net/summary.json)
 - [nodes.csv](/D:/Desktop/qoder%20work/crawl_output_gggl_test/gggl_cbpt_cnki_net/nodes.csv)
