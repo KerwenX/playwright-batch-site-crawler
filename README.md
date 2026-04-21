@@ -35,6 +35,33 @@
 - 普通多页站
 - 基于渲染后的 DOM 抽取链接
 - 通用按钮、分页、Tab、More 链接点击探测
+- 通用 SPA 脚本路由发现
+  - 会从同站 JS bundle 中提取 `path:\"/foo\"` 这类路由
+  - 对 hash SPA 会自动转成 `#/foo`
+  - 可以避免“首页几乎没有 DOM 链接，导致只抓到根页”的问题
+
+#### 1.1 Boyuan / `uniapp.boyuancb.com` 类站点
+
+这类站通常首页 DOM 链接很少，但会通过接口动态拉年份、期次和文章。
+
+当前已支持：
+
+- 从脚本里发现 `#/browse`、`#/guide`、`#/browse_details` 等前端路由
+- 从接口自动扩展：
+  - `GetJournalGapYear`
+  - `GetJournalYear`
+  - `GetThatYearIssueList`
+  - `GetJournalIssueList`
+  - `GetBackIssueBrowsing`
+  - `GetJournalArticleList`
+- 自动生成：
+  - `#/browse?year=YYYY`
+  - `#/browse?year=YYYY&issue=N`
+  - `#/browse_details?year=YYYY&issue=N&issuecid=ID`
+
+这类站点例子：
+
+- `http://www.chinacirculation.org`
 
 ### 2. `*.ajcass.com`
 
@@ -258,6 +285,10 @@ python3 server_batch_crawler.py
 - 已完成站点默认会跳过。
 - 当爬取策略版本升级后，旧检查点会自动识别为“需要继续补跑”。
 - 正在访问中的页面也会写入 checkpoint；异常退出后会重新入队，不会因为调度中的页面丢失覆盖。
+- 无论是否启用轻量 checkpoint，都会持续追加：
+  - `all_discovered_urls.live.txt`
+  - `all_discovered_urls.live.tsv`
+  用来实时查看“到目前为止新发现了哪些 URL”。
 
 ## 输出结构
 
@@ -271,6 +302,8 @@ crawl_output_batch/
   sites_summary.csv
   gggl_cbpt_cnki_net/
     all_discovered_urls.txt
+    all_discovered_urls.live.txt
+    all_discovered_urls.live.tsv
     checkpoint.json
     crawl.log
     edges.jsonl
@@ -291,6 +324,10 @@ crawl_output_batch/
 - `sites_summary.csv` 是按站点的汇总表。
 - 站点目录下的 `nodes.*` / `edges.*` / `visits.*` 是单站点明细。
 - 如果 `write_full_outputs_on_checkpoint = false`，运行中途这些明细文件可能不是最新状态；站点本轮结束时会统一刷新完整明细。
+- 运行中想看进度时，优先看：
+  - `summary.json`
+  - `all_discovered_urls.live.txt`
+  - `all_discovered_urls.live.tsv`
 
 ## 日志
 
@@ -305,6 +342,25 @@ crawl_output_batch/
 
 - 日常跑批：`log_level = "INFO"`
 - 深入排查：`log_level = "DEBUG"`
+
+## 本次通用站点验证
+
+2026 年 4 月 21 日，我用本地 `Python 3.14 + Playwright` 对下面三个站点做了限额回归：
+
+- `http://www.chinacirculation.org`
+- `http://www.cpedm.com`
+- `http://www.cssm.com.cn`
+
+在 `max_pages_per_site = 8`、`write_full_outputs_on_checkpoint = false` 的 smoke 配置下，结果是：
+
+- `chinacirculation`：`496` discovered，`235` queueable，`8` visited
+- `cpedm`：`429` discovered，`309` queueable，`8` visited
+- `cssm`：`192` discovered，`144` queueable，`8` visited
+
+其中 `chinacirculation` 的提升最明显：
+
+- 改造前：可继续访问的 URL 极少，容易表现成“只抓到首页”
+- 改造后：已经能自动产出大量 `#/browse?year=...&issue=...` 与 `#/browse_details?...` URL
 
 ## 本次 `gggl` 本地验证
 

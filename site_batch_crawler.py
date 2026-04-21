@@ -114,10 +114,33 @@ NON_HTML_SUFFIXES = {
 }
 URL_REGEX = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 RELATIVE_URL_REGEX = re.compile(r"(?P<url>(?:/|\./|\.\./|\?)[^\s\"'<>]+)")
+HASH_ROUTE_REGEX = re.compile(r"#/[A-Za-z0-9_./?=&%-]+")
 HTML_ATTR_REGEX = re.compile(
     r"(?P<attr>href|src|action|data-href|data-url|data-src|poster|onclick)\s*=\s*(?P<quote>[\"'])(?P<value>.*?)(?P=quote)",
     re.IGNORECASE | re.DOTALL,
 )
+GENERIC_SCRIPT_ROUTE_REGEX = re.compile(
+    r"(?:path|redirect|to)\s*:\s*[\"'](?P<route>/[A-Za-z0-9_./?=&%-]*)[\"']",
+    re.IGNORECASE,
+)
+STATIC_ASSET_PREFIXES = (
+    "/dist",
+    "/src",
+    "/assets",
+    "/static",
+    "/_nuxt",
+    "/js",
+    "/css",
+    "/img",
+    "/image",
+    "/images",
+    "/fonts",
+    "/media",
+    "/scripts",
+)
+BOYUAN_API_HOST = "uniapp.boyuancb.com"
+BOYUAN_SITE_WEB_API_PREFIX = f"https://{BOYUAN_API_HOST}/api/SiteWebApi/"
+BOYUAN_JOURNAL_INFO_API_PREFIX = f"https://{BOYUAN_API_HOST}/api/JournalInfoApi/"
 JS_CALL_REGEX = re.compile(r"^\s*(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\((?P<args>.*)\)\s*;?\s*$", re.DOTALL)
 JS_STRING_ARG_REGEX = re.compile(r"([\"'])(.*?)(?<!\\)\1", re.DOTALL)
 AJCASS_ROUTE_REGEX = re.compile(
@@ -642,6 +665,7 @@ class SiteCrawler:
         self.edges: List[Discovery] = []
         self.visits: List[PageVisit] = []
         self.discovered_via_source: Set[Tuple[str, str, str]] = set()
+        self.pending_discovered_nodes: List[Dict[str, Any]] = []
 
         self.expected_issue_search_urls: Set[str] = set()
         self.expected_issue_detail_urls: Set[str] = set()
@@ -671,6 +695,8 @@ class SiteCrawler:
         self.visits_path = self.config.output_dir / "visits.jsonl"
         self.visits_csv_path = self.config.output_dir / "visits.csv"
         self.all_urls_path = self.config.output_dir / "all_discovered_urls.txt"
+        self.all_urls_live_path = self.config.output_dir / "all_discovered_urls.live.txt"
+        self.all_urls_live_tsv_path = self.config.output_dir / "all_discovered_urls.live.tsv"
         self.same_site_urls_path = self.config.output_dir / "same_site_urls.txt"
         self.external_urls_path = self.config.output_dir / "external_or_non_queueable_urls.txt"
         self.seed_urls_path = self.config.output_dir / "seed_urls.txt"
@@ -827,6 +853,42 @@ class SiteCrawler:
             combined[item.url] = item
         return list(combined.values())
 
+    def flush_incremental_discovery_outputs(self) -> None:
+        if not self.pending_discovered_nodes:
+            return
+        self.config.output_dir.mkdir(parents=True, exist_ok=True)
+        url_lines = [node["url"] for node in self.pending_discovered_nodes]
+        tsv_lines = [
+            "\t".join(
+                [
+                    node["url"],
+                    str(bool(node["same_site"])),
+                    str(bool(node["queueable"])),
+                    str(int(node["first_depth"])),
+                    str(node["first_source"]),
+                    str(node["first_method"]),
+                    str(node["page_kind"]),
+                ]
+            )
+            for node in self.pending_discovered_nodes
+        ]
+        with self.all_urls_live_path.open("a", encoding="utf-8", newline="") as handle:
+            if url_lines:
+                handle.write("\n".join(url_lines) + "\n")
+        file_exists = self.all_urls_live_tsv_path.exists()
+        with self.all_urls_live_tsv_path.open("a", encoding="utf-8", newline="") as handle:
+            if not file_exists:
+                handle.write("url\tsame_site\tqueueable\tfirst_depth\tfirst_source\tfirst_method\tpage_kind\n")
+            if tsv_lines:
+                handle.write("\n".join(tsv_lines) + "\n")
+        self.logger.debug(
+            "Flushed incremental discovered URLs count=%s live_txt=%s live_tsv=%s",
+            len(self.pending_discovered_nodes),
+            self.all_urls_live_path,
+            self.all_urls_live_tsv_path,
+        )
+        self.pending_discovered_nodes = []
+
     async def handle_route(self, route) -> None:
         request = route.request
         request_url = request.url.lower()
@@ -875,6 +937,7 @@ class SiteCrawler:
         policy_matches = checkpoint_matches_current_policy(payload, self.config.visit_leaf_pages)
         self.frontier = deque(QueueItem(**item) for item in payload.get("frontier", []))
         self.active_queue_items = {}
+        self.pending_discovered_nodes = []
         self.discovered_urls = {
             item["url"]: item for item in payload.get("discovered_urls", [])
         }
@@ -1084,6 +1147,84 @@ class SiteCrawler:
         if lowered.startswith(("http://", "https://", "//", "/", "./", "../", "?", "#/", "data:", "blob:")):
             return True
         return any(token in candidate for token in ("/", ".", "?", "="))
+
+    def is_probably_static_asset_path(self, path: str) -> bool:
+        lowered = (path or "/").lower()
+        if lowered in STATIC_ASSET_PREFIXES:
+            return True
+        return any(lowered.startswith(f"{prefix}/") for prefix in STATIC_ASSET_PREFIXES)
+
+    def normalize_generic_route_candidate(self, route: str) -> str:
+        candidate = (route or "").strip()
+        if not candidate.startswith("/"):
+            return ""
+        path, separator, query = candidate.partition("?")
+        segments = []
+        for segment in path.split("/"):
+            segment = segment.strip()
+            if not segment:
+                continue
+            if segment in {"*", "(.*)"}:
+                continue
+            if segment.startswith(":"):
+                continue
+            segments.append(segment)
+        normalized_path = "/" + "/".join(segments) if segments else "/"
+        if self.is_probably_static_asset_path(normalized_path):
+            return ""
+        if normalized_path in {"/", "/404"}:
+            return ""
+        query_string = sort_query(query) if separator else ""
+        return normalized_path if not query_string else f"{normalized_path}?{query_string}"
+
+    def should_parse_script_response_url(self, response_url: str) -> bool:
+        normalized = self.normalize_url(response_url)
+        if not normalized:
+            return False
+        parts = urlsplit(normalized)
+        if parts.hostname != self.site_host:
+            return False
+        lowered_path = parts.path.lower()
+        return lowered_path.endswith(".js") or self.is_probably_static_asset_path(lowered_path)
+
+    def extract_generic_spa_routes_from_script(self, script_text: str, source_url: str) -> List[Tuple[str, str]]:
+        if self.is_ajcass:
+            return []
+        use_hash_routes = "#/" in source_url or any(
+            token in script_text
+            for token in (
+                "location.hash",
+                "hashchange",
+                "mode:\"hash\"",
+                "mode:'hash'",
+                "#/",
+            )
+        )
+        use_history_routes = not use_hash_routes and any(
+            token in script_text
+            for token in (
+                "createWebHistory",
+                "mode:\"history\"",
+                "mode:'history'",
+                "new VueRouter",
+                "routes:[",
+                "routes = [",
+            )
+        )
+        if not use_hash_routes and not use_history_routes:
+            return []
+        found: List[Tuple[str, str]] = []
+        seen: Set[str] = set()
+        for match in GENERIC_SCRIPT_ROUTE_REGEX.finditer(script_text):
+            route = self.normalize_generic_route_candidate(match.group("route"))
+            if not route or route in seen:
+                continue
+            seen.add(route)
+            if use_hash_routes:
+                found.append((f"{self.site_origin}/#{route}", "response:script:route"))
+            else:
+                found.append((f"{self.site_origin}{route}", "response:script:route"))
+        return found
 
     def extract_cbpt_portal_urls_from_onclick(self, onclick_value: str) -> List[str]:
         if self.site_family != "cbpt_cnki" or not self.site_host.endswith(".cbpt.cnki.net"):
@@ -1393,6 +1534,8 @@ class SiteCrawler:
             return False
         if any(parts.path.lower().endswith(suffix) for suffix in NON_HTML_SUFFIXES):
             return False
+        if self.is_probably_static_asset_path(parts.path):
+            return False
         if is_probably_unsafe_action_url(normalized):
             return False
         if self.site_family == "cbpt_cnki":
@@ -1497,6 +1640,7 @@ class SiteCrawler:
                 )
             )
 
+        is_new_node = normalized not in self.discovered_urls
         node = self.discovered_urls.setdefault(
             normalized,
             {
@@ -1512,6 +1656,8 @@ class SiteCrawler:
         )
         node["seen_count"] += 1
         node["first_depth"] = min(node["first_depth"], depth)
+        if is_new_node:
+            self.pending_discovered_nodes.append(dict(node))
         if self.page_kind(source_url) == "english_index" and page_kind == "english_issue":
             self.expected_en_issue_urls.add(normalized)
         if page_kind == "issue_detail":
@@ -1735,6 +1881,13 @@ class SiteCrawler:
                         (".simpM, .compM", "selector:cbpt-portal-view", 4),
                     ]
                 )
+        else:
+            plans.extend(
+                [
+                    ("[class*='title'], [class*='author'], [class*='article'], [class*='issue'], [class*='card']", "selector:generic-content", 10),
+                    (".swiper-slide, [class*='swiper-slide']", "selector:generic-swiper", 8),
+                ]
+            )
 
         plans.extend(
             [
@@ -1801,7 +1954,11 @@ class SiteCrawler:
                 cleaned = self.clean_extracted_url_candidate(match.group("url"))
                 if cleaned:
                     results.append(cleaned)
-            if candidate.startswith(("//", "/", "./", "../", "?")):
+            for match in HASH_ROUTE_REGEX.findall(candidate):
+                cleaned = self.clean_extracted_url_candidate(match)
+                if cleaned:
+                    results.append(cleaned)
+            if candidate.startswith(("//", "/", "./", "../", "?", "#/")):
                 results.append(candidate)
 
         if self.is_ajcass:
@@ -2060,8 +2217,240 @@ class SiteCrawler:
             found.extend((url, "api:GetContentInfo:inline") for url in self.iter_string_urls(item))
         return found
 
-    async def parse_script_response(self, response: Response) -> List[Tuple[str, str]]:
-        if not self.is_ajcass or response.url in self.processed_script_requests:
+    def is_boyuan_api_url(self, url: str) -> bool:
+        lowered = (url or "").lower()
+        return f"https://{BOYUAN_API_HOST}/api/" in lowered or f"http://{BOYUAN_API_HOST}/api/" in lowered
+
+    def build_boyuan_browse_url(self, year: Any = None, issue: Any = None) -> str:
+        params: List[Tuple[str, Any]] = []
+        if year not in (None, ""):
+            params.append(("year", year))
+        if issue not in (None, ""):
+            params.append(("issue", issue))
+        base = f"{self.site_origin}/#/browse"
+        if not params:
+            return base
+        return f"{base}?{urlencode(params, doseq=True)}"
+
+    def build_boyuan_browse_detail_url(self, *, item_id: Any, year: Any = None, issue: Any = None) -> Optional[str]:
+        if item_id in (None, ""):
+            return None
+        params: List[Tuple[str, Any]] = [("issuecid", item_id)]
+        if year not in (None, ""):
+            params.insert(0, ("year", year))
+        if issue not in (None, ""):
+            params.insert(1 if year not in (None, "") else 0, ("issue", issue))
+        return f"{self.site_origin}/#/browse_details?{urlencode(params, doseq=True)}"
+
+    def parse_boyuan_article_items(
+        self,
+        items: Optional[List[Dict[str, Any]]],
+        method: str,
+        *,
+        year: Any = None,
+        issue: Any = None,
+    ) -> List[Tuple[str, str]]:
+        found: List[Tuple[str, str]] = []
+        if not items:
+            return found
+        for item in items:
+            item_year = item.get("year", year)
+            item_issue = item.get("issue", issue)
+            detail_url = self.build_boyuan_browse_detail_url(
+                item_id=item.get("id") or item.get("issuecid") or item.get("issueCid"),
+                year=item_year,
+                issue=item_issue,
+            )
+            if detail_url:
+                found.append((detail_url, method))
+            for field in ("filePath", "pdfPath", "htmlPath", "otherPath", "titlePhoto"):
+                value = str(item.get(field) or "").strip()
+                if value:
+                    found.append((value, f"{method}:{field}"))
+        return found
+
+    async def parse_boyuan_journal_year_response(
+        self,
+        data: Dict[str, Any],
+        journal_id: Any,
+        api_context: Any,
+        gap_year: Any,
+    ) -> List[Tuple[str, str]]:
+        found: List[Tuple[str, str]] = []
+        if journal_id in (None, ""):
+            return found
+        for item in data.get("data") or []:
+            year = item.get("year")
+            if year in (None, ""):
+                continue
+            found.append((self.build_boyuan_browse_url(year=year), "api:GetJournalYear:browse"))
+            fetch_url = f"{BOYUAN_SITE_WEB_API_PREFIX}GetThatYearIssueList?journalId={journal_id}&year={year}"
+            fetch_key = f"boyuan:GetThatYearIssueList|{fetch_url}"
+            if fetch_key in self.fetched_api_pages:
+                continue
+            self.fetched_api_pages.add(fetch_key)
+            try:
+                response = await api_context.get(fetch_url)
+                payload = await response.json()
+            except Exception as exc:
+                self.logger.warning("Failed to expand Boyuan year issues journal_id=%s year=%s error=%s", journal_id, year, exc)
+                continue
+            found.extend(await self.parse_boyuan_issue_list_response(payload, year=year, api_context=api_context))
+        return found
+
+    async def parse_boyuan_gap_year_response(
+        self,
+        data: Dict[str, Any],
+        request_params: Dict[str, Any],
+        api_context: Any,
+    ) -> List[Tuple[str, str]]:
+        journal_id = request_params.get("journalId")
+        if journal_id in (None, ""):
+            return []
+        gap_size = request_params.get("gapYear", 10)
+        found: List[Tuple[str, str]] = []
+        seen_groups: Set[Any] = set()
+        for item in data.get("data") or []:
+            group_year = item.get("year")
+            if group_year in (None, "") or group_year in seen_groups:
+                continue
+            seen_groups.add(group_year)
+            fetch_url = f"{BOYUAN_SITE_WEB_API_PREFIX}GetJournalYear?journalId={journal_id}&year={group_year}&gapYear={gap_size}"
+            fetch_key = f"boyuan:GetJournalYear|{fetch_url}"
+            if fetch_key in self.fetched_api_pages:
+                continue
+            self.fetched_api_pages.add(fetch_key)
+            try:
+                response = await api_context.get(fetch_url)
+                payload = await response.json()
+            except Exception as exc:
+                self.logger.warning("Failed to expand Boyuan gap year journal_id=%s group_year=%s error=%s", journal_id, group_year, exc)
+                continue
+            found.extend(await self.parse_boyuan_journal_year_response(payload, journal_id=journal_id, api_context=api_context, gap_year=gap_size))
+        return found
+
+    async def parse_boyuan_issue_list_response(
+        self,
+        data: Dict[str, Any],
+        *,
+        year: Any,
+        api_context: Any,
+    ) -> List[Tuple[str, str]]:
+        found: List[Tuple[str, str]] = []
+        issues = data.get("data") or []
+        for item in issues:
+            issue = item.get("issue")
+            if issue in (None, ""):
+                continue
+            found.append((self.build_boyuan_browse_url(year=year, issue=issue), "api:GetThatYearIssueList:browse"))
+            title_photo = str(item.get("titlePhoto") or "").strip()
+            if title_photo:
+                found.append((title_photo, "api:GetThatYearIssueList:titlePhoto"))
+        return found
+
+    async def parse_paginated_boyuan_back_issue(
+        self,
+        source_url: str,
+        payload: Dict[str, Any],
+        total_pages: int,
+        api_context: Any,
+    ) -> List[Tuple[str, str]]:
+        found: List[Tuple[str, str]] = []
+        current = int(payload.get("curr", 1))
+        page_numbers = list(range(current + 1, total_pages + 1))
+        if self.config.max_api_pages_per_series:
+            page_numbers = page_numbers[: self.config.max_api_pages_per_series]
+        for page_num in page_numbers:
+            next_payload = dict(payload)
+            next_payload["curr"] = page_num
+            fetch_key = f"boyuan:GetBackIssueBrowsing|{json.dumps(next_payload, ensure_ascii=False, sort_keys=True)}"
+            if fetch_key in self.fetched_api_pages:
+                continue
+            self.fetched_api_pages.add(fetch_key)
+            try:
+                response = await api_context.post(f"{BOYUAN_SITE_WEB_API_PREFIX}GetBackIssueBrowsing", data=next_payload)
+                data = await response.json()
+            except Exception as exc:
+                self.logger.warning("Failed to expand Boyuan back issue source=%s page=%s error=%s", source_url, page_num, exc)
+                continue
+            found.extend(
+                await self.parse_boyuan_back_issue_response(
+                    data,
+                    payload=next_payload,
+                    source_url=source_url,
+                    api_context=api_context,
+                    allow_pagination=False,
+                )
+            )
+        return found
+
+    async def parse_boyuan_back_issue_response(
+        self,
+        data: Dict[str, Any],
+        *,
+        payload: Dict[str, Any],
+        source_url: str,
+        api_context: Any,
+        allow_pagination: bool = True,
+    ) -> List[Tuple[str, str]]:
+        year = payload.get("year")
+        issue = payload.get("issue")
+        found = self.parse_boyuan_article_items(data.get("data") or [], "api:GetBackIssueBrowsing:detail", year=year, issue=issue)
+        total_pages = int(data.get("totalpage") or 1)
+        if allow_pagination and total_pages > int(payload.get("curr", 1)):
+            found.extend(await self.parse_paginated_boyuan_back_issue(source_url, payload, total_pages, api_context))
+        return found
+
+    async def parse_boyuan_json_response(
+        self,
+        data: Dict[str, Any],
+        response: Response,
+        source_url: str,
+        api_context: Any,
+    ) -> List[Tuple[str, str]]:
+        url = response.url
+        request = response.request
+        params = dict(parse_qsl(urlsplit(url).query, keep_blank_values=True))
+        if "GetJournalGapYear" in url:
+            return await self.parse_boyuan_gap_year_response(data, params, api_context)
+        if "GetJournalYear" in url:
+            return await self.parse_boyuan_journal_year_response(
+                data,
+                journal_id=params.get("journalId"),
+                api_context=api_context,
+                gap_year=params.get("gapYear"),
+            )
+        if "GetThatYearIssueList" in url:
+            return await self.parse_boyuan_issue_list_response(data, year=params.get("year"), api_context=api_context)
+        if "GetJournalIssueList" in url:
+            return [
+                (self.build_boyuan_browse_url(year=params.get("year"), issue=item.get("issue")), "api:GetJournalIssueList:browse")
+                for item in (data.get("data") or [])
+                if item.get("issue") not in (None, "")
+            ]
+        if "GetBackIssueBrowsing" in url:
+            try:
+                payload = request.post_data_json or {}
+            except Exception:
+                payload = {}
+            return await self.parse_boyuan_back_issue_response(data, payload=payload, source_url=source_url, api_context=api_context)
+        if "GetJournalArticleList" in url:
+            try:
+                payload = request.post_data_json or {}
+            except Exception:
+                payload = {}
+            return self.parse_boyuan_article_items(
+                data.get("data") or [],
+                "api:GetJournalArticleList:detail",
+                year=payload.get("year"),
+                issue=payload.get("issue"),
+            )
+        return []
+
+    async def parse_script_response(self, response: Response, source_url: str) -> List[Tuple[str, str]]:
+        if response.url in self.processed_script_requests:
+            return []
+        if not self.is_ajcass and not self.should_parse_script_response_url(response.url):
             return []
         self.processed_script_requests.add(response.url)
         try:
@@ -2071,10 +2460,13 @@ class SiteCrawler:
             return []
 
         found: List[Tuple[str, str]] = []
-        for route in AJCASS_SCRIPT_ROUTE_CANDIDATES:
-            if f'"{route}"' in text or f"'{route}'" in text:
-                self.ajcass_known_routes.add(route)
-                found.append((f"{self.site_origin}/#{route}", "response:script:route"))
+        if self.is_ajcass:
+            for route in AJCASS_SCRIPT_ROUTE_CANDIDATES:
+                if f'"{route}"' in text or f"'{route}'" in text:
+                    self.ajcass_known_routes.add(route)
+                    found.append((f"{self.site_origin}/#{route}", "response:script:route"))
+        else:
+            found.extend(self.extract_generic_spa_routes_from_script(text, source_url))
         return found
 
     async def parse_json_response(self, response: Response, source_url: str, depth: int, page_kind: str, api_context: Any) -> List[Tuple[str, str]]:
@@ -2133,6 +2525,8 @@ class SiteCrawler:
                 found.extend(self.parse_ajcass_issue_items(data.get("data") or [], "api:GetIssueinfoList:issueDetail"))
             elif "GetContentInfo" in url:
                 found.extend(self.parse_content_info(data))
+        elif self.is_boyuan_api_url(url):
+            found.extend(await self.parse_boyuan_json_response(data, response, source_url, api_context))
         found.extend((url_candidate, "response:json") for url_candidate in self.iter_string_urls(data))
         return found
 
@@ -2140,8 +2534,8 @@ class SiteCrawler:
         content_type = response.headers.get("content-type", "").lower()
         if "application/json" in content_type or "+json" in content_type:
             return await self.parse_json_response(response, source_url, depth, page_kind, api_context)
-        if self.is_ajcass and ("javascript" in content_type or response.url.lower().endswith(".js")):
-            return await self.parse_script_response(response)
+        if "javascript" in content_type or response.url.lower().endswith(".js"):
+            return await self.parse_script_response(response, source_url)
         return []
 
     async def process_page(self, item: QueueItem) -> None:
@@ -2176,7 +2570,7 @@ class SiteCrawler:
                 response.request.resource_type in {"document", "xhr", "fetch"}
                 or "application/json" in response.headers.get("content-type", "").lower()
                 or any(response.url.lower().endswith(suffix) for suffix in NON_HTML_SUFFIXES)
-                or (self.is_ajcass and response.request.resource_type == "script")
+                or (response.request.resource_type == "script" and self.should_parse_script_response_url(response.url))
             )
             if not interesting:
                 return
@@ -2567,6 +2961,7 @@ class SiteCrawler:
             "ajcass_issue_route": self.ajcass_issue_route,
         }
         atomic_write_text(self.checkpoint_path, json.dumps(payload, ensure_ascii=False, indent=2))
+        self.flush_incremental_discovery_outputs()
         self.pages_since_checkpoint = 0
         self.last_checkpoint_at = now
         self.logger.info(
