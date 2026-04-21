@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import html as html_lib
 import io
 import json
 import logging
@@ -29,7 +30,7 @@ from playwright.async_api import (
 
 DEFAULT_CONFIG_PATH = "config.json"
 DEFAULT_INPUT_URLS_FILE = "input_urls.txt"
-CRAWL_POLICY_VERSION = 2
+CRAWL_POLICY_VERSION = 3
 AJCASS_HOST = "zgncjj.ajcass.com"
 AJCASS_HOST_SUFFIX = ".ajcass.com"
 AJCASS_SITE_CONTENT_API = "https://api.ajcass.com/api/JournalInfoApi/GetSiteContentPageList"
@@ -113,6 +114,12 @@ NON_HTML_SUFFIXES = {
 }
 URL_REGEX = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 RELATIVE_URL_REGEX = re.compile(r"(?P<url>(?:/|\./|\.\./|\?)[^\s\"'<>]+)")
+HTML_ATTR_REGEX = re.compile(
+    r"(?P<attr>href|src|action|data-href|data-url|data-src|poster|onclick)\s*=\s*(?P<quote>[\"'])(?P<value>.*?)(?P=quote)",
+    re.IGNORECASE | re.DOTALL,
+)
+JS_CALL_REGEX = re.compile(r"^\s*(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\((?P<args>.*)\)\s*;?\s*$", re.DOTALL)
+JS_STRING_ARG_REGEX = re.compile(r"([\"'])(.*?)(?<!\\)\1", re.DOTALL)
 AJCASS_ROUTE_REGEX = re.compile(
     r"(?:^|[\"'=])(?P<route>(?:/|#/)("
     r"index|detail|search|issueDetail|issue|enIndex|enIssue"
@@ -232,6 +239,13 @@ class PageVisit:
         return int((self.finished_at - self.started_at) * 1000)
 
 
+@dataclass(frozen=True)
+class PortalAjaxAction:
+    url: str
+    payload: Dict[str, Any]
+    method: str
+
+
 @dataclass
 class BatchConfig:
     input_urls_file: str
@@ -251,6 +265,8 @@ class BatchConfig:
     include_site_homepage_seed: bool = True
     enable_generic_interactions: bool = True
     max_interaction_clicks_per_page: int = 18
+    enable_cbpt_portal_ajax_expansion: bool = True
+    max_cbpt_portal_ajax_requests_per_page: int = 12
     max_api_pages_per_series: int = 0
     proxy_servers: List[Dict[str, str]] = field(default_factory=list)
     proxy_session_count: int = 0
@@ -282,6 +298,8 @@ class BatchConfig:
             include_site_homepage_seed=bool(payload.get("include_site_homepage_seed", True)),
             enable_generic_interactions=bool(payload.get("enable_generic_interactions", True)),
             max_interaction_clicks_per_page=max(0, int(payload.get("max_interaction_clicks_per_page", 18))),
+            enable_cbpt_portal_ajax_expansion=bool(payload.get("enable_cbpt_portal_ajax_expansion", True)),
+            max_cbpt_portal_ajax_requests_per_page=max(0, int(payload.get("max_cbpt_portal_ajax_requests_per_page", 12))),
             max_api_pages_per_series=max(0, int(payload.get("max_api_pages_per_series", 0))),
             proxy_servers=load_proxy_servers(payload.get("proxy_servers")),
             proxy_session_count=max(0, int(payload.get("proxy_session_count", 0))),
@@ -313,6 +331,8 @@ class SiteConfig:
     visit_leaf_pages: bool
     enable_generic_interactions: bool
     max_interaction_clicks_per_page: int
+    enable_cbpt_portal_ajax_expansion: bool
+    max_cbpt_portal_ajax_requests_per_page: int
     max_api_pages_per_series: int
     proxy_servers: List[Dict[str, str]]
     proxy_session_count: int
@@ -474,6 +494,23 @@ def cbpt_query_params(url: str) -> Dict[str, str]:
     }
 
 
+def unescape_js_string(value: str) -> str:
+    return (
+        value.replace("\\\\", "\\")
+        .replace("\\'", "'")
+        .replace('\\"', '"')
+        .strip()
+    )
+
+
+def parse_js_call(value: str) -> Tuple[Optional[str], List[str]]:
+    match = JS_CALL_REGEX.match((value or "").strip())
+    if not match:
+        return None, []
+    args = [unescape_js_string(item.group(2)) for item in JS_STRING_ARG_REGEX.finditer(match.group("args"))]
+    return match.group("name"), args
+
+
 def is_probably_unsafe_action_url(url: str) -> bool:
     parts = urlsplit(url)
     path_segments = [segment for segment in parts.path.lower().split("/") if segment]
@@ -500,7 +537,7 @@ def sort_query(query: str) -> str:
     params = [
         (key, value)
         for key, value in parse_qsl(query, keep_blank_values=True)
-        if key not in TRACKING_QUERY_KEYS
+        if key not in TRACKING_QUERY_KEYS and value != ""
     ]
     return urlencode(sorted(params), doseq=True)
 
@@ -945,6 +982,8 @@ class SiteCrawler:
             netloc = f"{host}:{parts.port}"
 
         path = parts.path or "/"
+        if host == self.site_host:
+            path = re.sub(r"/{2,}", "/", path)
         query = sort_query(parts.query)
         fragment = parts.fragment
         if self.is_ajcass and host == self.site_host:
@@ -992,6 +1031,250 @@ class SiteCrawler:
     def has_ajcass_route(self, route: str) -> bool:
         return route in self.ajcass_known_routes
 
+    def is_cbpt_portal_url(self, url: str) -> bool:
+        if self.site_family != "cbpt_cnki":
+            return False
+        normalized = self.normalize_url(url)
+        if not normalized:
+            return False
+        parts = urlsplit(normalized)
+        lowered_path = parts.path.lower()
+        return parts.hostname == self.site_host and (
+            lowered_path == "/portal"
+            or lowered_path.startswith("/portal/")
+            or "/portal/journal/portal/" in lowered_path
+        )
+
+    def build_cbpt_portal_url(self, path: str, query_params: Optional[List[Tuple[str, Any]]] = None) -> str:
+        relative_path = path if path.startswith("/") else f"/{path}"
+        url = f"{self.site_origin}{relative_path}"
+        params = [(key, value) for key, value in (query_params or []) if value not in (None, "")]
+        if not params:
+            return url
+        return f"{url}?{urlencode(params, doseq=True)}"
+
+    def is_urlish_attribute_value(self, value: str) -> bool:
+        candidate = (value or "").strip()
+        if not candidate:
+            return False
+        lowered = candidate.lower()
+        if lowered.startswith(("http://", "https://", "//", "/", "./", "../", "?", "#/", "data:", "blob:")):
+            return True
+        return any(token in candidate for token in ("/", ".", "?", "="))
+
+    def extract_cbpt_portal_urls_from_onclick(self, onclick_value: str) -> List[str]:
+        if self.site_family != "cbpt_cnki" or not self.site_host.endswith(".cbpt.cnki.net"):
+            return []
+
+        name, args = parse_js_call(onclick_value)
+        if not name:
+            return []
+
+        if name == "goNewList" and len(args) >= 1:
+            title = args[1] if len(args) > 1 else ""
+            return [self.build_cbpt_portal_url(f"/portal/journal/portal/client/list/{args[0]}", [("title", title)])]
+        if name == "goDownloadList" and len(args) >= 1:
+            title = args[1] if len(args) > 1 else ""
+            return [self.build_cbpt_portal_url(f"/portal/journal/portal/client/download/{args[0]}", [("title", title)])]
+        if name == "goLinkpostList" and len(args) >= 1:
+            title = args[1] if len(args) > 1 else ""
+            return [self.build_cbpt_portal_url(f"/portal/journal/portal/client/linkpost/{args[0]}", [("title", title)])]
+        if name == "guokanTurnPageList" and len(args) >= 4:
+            return [
+                self.build_cbpt_portal_url(
+                    "/portal/journal/portal/client/guokan_list",
+                    [
+                        ("year", args[0]),
+                        ("issue", args[1]),
+                        ("yearId", args[2]),
+                        ("issueId", args[3]),
+                    ],
+                )
+            ]
+        if name in {"getChineseHtmlUrl", "getSpecialPDFUrl"} and len(args) >= 1:
+            return [
+                self.build_cbpt_portal_url(
+                    "/portal/journal/portal/journal/api/getChinesDownloadInfoByEnglishPaper",
+                    [("contentId", args[0])],
+                )
+            ]
+        if name == "gotoCNKINode" and len(args) >= 1:
+            return [
+                self.build_cbpt_portal_url(
+                    "/portal/journal/portal/journal/api/gotoCNKINodeUrl",
+                    [("id", args[0])],
+                )
+            ]
+        if name == "tabPage" and len(args) >= 6:
+            page_path = args[3].lstrip("/")
+            if not page_path.startswith("portal/journal/portal/"):
+                page_path = f"portal/journal/portal/{page_path}"
+            return [
+                self.build_cbpt_portal_url(
+                    f"/{page_path}",
+                    [
+                        ("year", args[0]),
+                        ("issue", args[1]),
+                        ("pageNum", args[2]),
+                        ("yearId", args[4]),
+                        ("issueId", args[5]),
+                    ],
+                )
+            ]
+        if name == "lastNextIssue" and len(args) >= 5:
+            direction = args[0]
+            return [
+                self.build_cbpt_portal_url(
+                    f"/portal/journal/portal/journal/api/listPrePaperOrNextPaper/{direction}",
+                    [
+                        ("year", args[1]),
+                        ("issue", args[2]),
+                        ("yearId", args[3]),
+                        ("issueId", args[4]),
+                        ("pageNum", 1),
+                        ("pageSize", 10),
+                    ],
+                )
+            ]
+        return []
+
+    def extract_urls_from_html_fragment(self, html_text: str) -> List[str]:
+        urls: List[str] = []
+        for match in HTML_ATTR_REGEX.finditer(html_text or ""):
+            attr = (match.group("attr") or "").lower()
+            value = html_lib.unescape(match.group("value") or "").strip()
+            if not value:
+                continue
+            urls.extend(self.extract_urls_from_string(value, allow_relative=True))
+            if attr == "onclick":
+                urls.extend(self.extract_cbpt_portal_urls_from_onclick(value))
+            elif self.is_urlish_attribute_value(value):
+                urls.append(value)
+        urls.extend(self.extract_urls_from_string(html_text or "", allow_relative=False))
+        return urls
+
+    def cbpt_portal_ajax_action_from_onclick(self, onclick_value: str) -> Optional[PortalAjaxAction]:
+        if self.site_family != "cbpt_cnki" or not self.site_host.endswith(".cbpt.cnki.net"):
+            return None
+
+        name, args = parse_js_call(onclick_value)
+        if name == "tabPage" and len(args) >= 6:
+            page_num = str(args[2]).strip()
+            if page_num in {"", "1"}:
+                return None
+            page_path = args[3].lstrip("/")
+            if not page_path.startswith("portal/journal/portal/"):
+                page_path = f"portal/journal/portal/{page_path}"
+            return PortalAjaxAction(
+                url=self.build_cbpt_portal_url(f"/{page_path}"),
+                payload={
+                    "yearId": args[4],
+                    "issueId": args[5],
+                    "year": args[0],
+                    "issue": args[1],
+                    "pageNum": page_num,
+                    "pageSize": 10,
+                    "isSimple": "0",
+                },
+                method=f"portal:ajax:{name}:{page_num}",
+            )
+        if name == "lastNextIssue" and len(args) >= 5:
+            direction = str(args[0]).strip().lower() or "next"
+            return PortalAjaxAction(
+                url=self.build_cbpt_portal_url(f"/portal/journal/portal/journal/api/listPrePaperOrNextPaper/{direction}"),
+                payload={
+                    "yearId": args[3],
+                    "issueId": args[4],
+                    "year": args[1],
+                    "issue": args[2],
+                    "pageNum": 1,
+                    "pageSize": 10,
+                    "isSimple": "0",
+                },
+                method=f"portal:ajax:{name}:{direction}",
+            )
+        return None
+
+    async def discover_cbpt_portal_ajax_urls(self, page: Page, source_url: str, page_kind: str) -> List[Tuple[str, str]]:
+        if (
+            not self.config.enable_cbpt_portal_ajax_expansion
+            or self.config.max_cbpt_portal_ajax_requests_per_page <= 0
+            or not self.is_cbpt_portal_url(source_url)
+            or page_kind not in {"cbpt_portal_index", "cbpt_portal_list", "cbpt_portal_news", "cbpt_portal_aux", "page"}
+        ):
+            return []
+
+        onclick_values = await page.evaluate(
+            """() => Array.from(document.querySelectorAll('[onclick]'))
+                .map(el => (el.getAttribute('onclick') || '').trim())
+                .filter(Boolean)"""
+        )
+        actions: List[PortalAjaxAction] = []
+        seen: Set[str] = set()
+        for onclick_value in onclick_values:
+            if not isinstance(onclick_value, str):
+                continue
+            action = self.cbpt_portal_ajax_action_from_onclick(onclick_value)
+            if action is None:
+                continue
+            action_key = f"{action.url}|{json.dumps(action.payload, ensure_ascii=False, sort_keys=True)}"
+            if action_key in seen:
+                continue
+            seen.add(action_key)
+            actions.append(action)
+
+        if not actions:
+            return []
+
+        found: List[Tuple[str, str]] = []
+        self.logger.debug(
+            "CBPT portal ajax expansion start page_kind=%s source=%s actions=%s limit=%s",
+            page_kind,
+            source_url,
+            len(actions),
+            self.config.max_cbpt_portal_ajax_requests_per_page,
+        )
+        for action in actions[: self.config.max_cbpt_portal_ajax_requests_per_page]:
+            found.append((action.url, action.method))
+            try:
+                html_text = await asyncio.wait_for(
+                    page.evaluate(
+                        """async ({url, payload}) => {
+                            const response = await fetch(url, {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/json; charset=UTF-8',
+                                    'X-Requested-With': 'XMLHttpRequest'
+                                },
+                                credentials: 'same-origin',
+                                body: JSON.stringify(payload)
+                            });
+                            return await response.text();
+                        }""",
+                        {"url": action.url, "payload": action.payload},
+                    ),
+                    timeout=max(5.0, self.config.timeout_ms / 1000.0),
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    "CBPT portal ajax expansion failed kind=%s url=%s method=%s error=%s",
+                    page_kind,
+                    source_url,
+                    action.method,
+                    exc,
+                )
+                continue
+
+            for discovered_url in self.extract_urls_from_html_fragment(html_text if isinstance(html_text, str) else ""):
+                found.append((discovered_url, f"{action.method}:html"))
+        self.logger.debug(
+            "CBPT portal ajax expansion end page_kind=%s source=%s discoveries=%s",
+            page_kind,
+            source_url,
+            len(found),
+        )
+        return found
+
     def page_kind(self, url: str) -> str:
         normalized = self.normalize_url(url)
         if not normalized:
@@ -1016,6 +1299,35 @@ class SiteCrawler:
         if self.site_family == "cbpt_cnki" and parts.hostname == self.site_host:
             lowered_path = parts.path.lower()
             params = cbpt_query_params(normalized)
+            if self.is_cbpt_portal_url(normalized):
+                if lowered_path == "/portal" or lowered_path.endswith("/client/index"):
+                    return "cbpt_portal_index"
+                if "/portal/journal/portal/client/paper/" in lowered_path:
+                    return "cbpt_portal_article"
+                if "/portal/journal/portal/client/news/" in lowered_path:
+                    return "cbpt_portal_news"
+                if (
+                    "/portal/journal/portal/journal/api/" in lowered_path
+                    or "/portal/journal/portal/common/api/" in lowered_path
+                    or lowered_path.endswith("/client/paperpage_list")
+                ):
+                    return "cbpt_portal_api"
+                if any(
+                    token in lowered_path
+                    for token in (
+                        "/portal/journal/portal/client/guokan_list",
+                        "/portal/journal/portal/client/paper_list/",
+                        "/portal/journal/portal/client/paperrank_list/",
+                        "/portal/journal/portal/client/shoufa_list",
+                        "/portal/journal/portal/client/list/",
+                        "/portal/journal/portal/client/download/",
+                        "/portal/journal/portal/client/linkpost/",
+                    )
+                ):
+                    return "cbpt_portal_list"
+                return "cbpt_portal_aux"
+            if lowered_path.startswith("/api/"):
+                return "cbpt_aux"
             if lowered_path == "/index.aspx" and params.get("t"):
                 return "cbpt_aux"
             if lowered_path.endswith("/showvalidatecode.aspx") or lowered_path.endswith("/validatecode.aspx") or lowered_path.endswith("/error.aspx") or lowered_path.endswith("/quit.aspx"):
@@ -1071,6 +1383,14 @@ class SiteCrawler:
                 or lowered_path.endswith("/kbdownload.aspx")
             ):
                 return False
+            if lowered_path.startswith("/api/"):
+                return False
+            if (
+                "/portal/journal/portal/journal/api/" in lowered_path
+                or "/portal/journal/portal/common/api/" in lowered_path
+                or lowered_path.endswith("/client/paperpage_list")
+            ):
+                return False
         if self.is_ajcass and parts.fragment:
             return self.ajcass_route_from_url(normalized).startswith("/")
         return True
@@ -1082,7 +1402,14 @@ class SiteCrawler:
             return True
         if self.is_ajcass and self.page_kind(url) in AJCASS_LEAF_PAGE_KINDS:
             return False
-        if self.site_family == "cbpt_cnki" and self.page_kind(url) in {"cbpt_article", "cbpt_aux", "cbpt_guard"}:
+        if self.site_family == "cbpt_cnki" and self.page_kind(url) in {
+            "cbpt_article",
+            "cbpt_aux",
+            "cbpt_guard",
+            "cbpt_portal_article",
+            "cbpt_portal_api",
+            "cbpt_portal_aux",
+        }:
             return False
         return True
 
@@ -1238,11 +1565,13 @@ class SiteCrawler:
                 continue
             attr = str(item.get("attr") or "")
             urls.extend(self.extract_urls_from_string(value, allow_relative=True))
-            if attr in {"href", "src", "action", "data-href", "data-url", "data-src", "poster", "location"}:
+            if attr == "onclick":
+                urls.extend(self.extract_cbpt_portal_urls_from_onclick(value))
+            if attr in {"href", "src", "action", "data-href", "data-url", "data-src", "poster", "location"} and self.is_urlish_attribute_value(value):
                 urls.append(value)
         html = payload.get("html")
         if isinstance(html, str):
-            urls.extend(self.extract_urls_from_string(html, allow_relative=False))
+            urls.extend(self.extract_urls_from_html_fragment(html))
         return urls
 
     async def probe_click_texts(self, page: Page, source_url: str, depth: int, labels: list[str]) -> list[tuple[str, str]]:
@@ -1367,6 +1696,22 @@ class SiteCrawler:
                     (".el-carousel__button", "selector:.el-carousel__button", 6),
                 ]
             )
+        elif self.is_cbpt_portal_url(source_url):
+            if page_kind in {"cbpt_portal_index", "cbpt_portal_aux"}:
+                plans.extend(
+                    [
+                        (".paperNav a, .moreBtn, .listZone_more", "selector:cbpt-portal-home", 12),
+                        ("a[target='_blank']", "selector:cbpt-portal-blank", 8),
+                    ]
+                )
+            if page_kind in {"cbpt_portal_index", "cbpt_portal_list", "cbpt_portal_news", "cbpt_portal_aux"}:
+                plans.extend(
+                    [
+                        (".pageNum, .nextBtn, .endBtn, .lastBtn, .prevBtn, .moreNum", "selector:cbpt-portal-page", 12),
+                        (".paperNav a, .moreBtn, .listZone_more, .nowPast", "selector:cbpt-portal-nav", 10),
+                        (".simpM, .compM", "selector:cbpt-portal-view", 4),
+                    ]
+                )
 
         plans.extend(
             [
@@ -1402,9 +1747,15 @@ class SiteCrawler:
             cleaned_chars.append(ch)
 
         cleaned = "".join(cleaned_chars).rstrip(").,;:!?]}")
+        if cleaned.lower().startswith(("javascript:", "mailto:", "tel:", "data:", "blob:")):
+            return None
         for entity in ("&quot;", "&#34;", "&#39;", "&apos;", "&gt;", "&lt;"):
             if entity in cleaned:
                 cleaned = cleaned.split(entity, 1)[0]
+        if any(ch in cleaned for ch in "{}[]|"):
+            return None
+        if cleaned.startswith("/") and len(cleaned) <= 4 and cleaned.strip("/").isdigit():
+            return None
         if cleaned in {"", "/", "//", "?", "./", "../"}:
             return None
         return cleaned
@@ -1412,6 +1763,9 @@ class SiteCrawler:
     def extract_urls_from_string(self, value: str, *, allow_relative: bool) -> list[str]:
         candidate = value.strip()
         if not candidate:
+            return []
+        lowered_candidate = candidate.lower()
+        if lowered_candidate.startswith(("javascript:", "mailto:", "tel:", "data:", "blob:")):
             return []
 
         results: list[str] = []
@@ -1826,7 +2180,19 @@ class SiteCrawler:
 
             visit.final_url = page.url
             visit.page_kind = self.page_kind(page.url)
-            visit.title = await page.title()
+            try:
+                visit.title = await page.title()
+            except Exception as exc:
+                visit.final_url = page.url
+                visit.page_kind = self.page_kind(page.url)
+                visit.title = ""
+                self.logger.debug(
+                    "Failed to read page title depth=%s requested=%s final=%s error=%s",
+                    item.depth,
+                    item.url,
+                    visit.final_url,
+                    exc,
+                )
             self.remember_ajcass_route(page.url)
 
             for dom_url in await self.extract_dom_urls(page):
@@ -1857,6 +2223,8 @@ class SiteCrawler:
                             limit=12,
                         )
                     )
+            elif self.is_cbpt_portal_url(page.url):
+                discoveries.extend(await self.discover_cbpt_portal_ajax_urls(page, page.url, visit.page_kind))
             discoveries.extend(await self.run_generic_interactions(page, page.url, visit.page_kind))
 
             if response_tasks:
@@ -2024,6 +2392,8 @@ class SiteCrawler:
                 "proxy_servers_count": len(self.config.proxy_servers),
                 "proxy_session_count": proxy_session_count,
                 "skip_failed_proxies": self.config.skip_failed_proxies,
+                "enable_cbpt_portal_ajax_expansion": self.config.enable_cbpt_portal_ajax_expansion,
+                "max_cbpt_portal_ajax_requests_per_page": self.config.max_cbpt_portal_ajax_requests_per_page,
             },
             "verification": {
                 "expected_issue_search_urls": len(self.expected_issue_search_urls),
@@ -2205,6 +2575,8 @@ class BatchRunner:
                     visit_leaf_pages=self.batch_config.visit_leaf_pages,
                     enable_generic_interactions=self.batch_config.enable_generic_interactions,
                     max_interaction_clicks_per_page=self.batch_config.max_interaction_clicks_per_page,
+                    enable_cbpt_portal_ajax_expansion=self.batch_config.enable_cbpt_portal_ajax_expansion,
+                    max_cbpt_portal_ajax_requests_per_page=self.batch_config.max_cbpt_portal_ajax_requests_per_page,
                     max_api_pages_per_series=self.batch_config.max_api_pages_per_series,
                     proxy_servers=self.batch_config.proxy_servers,
                     proxy_session_count=self.batch_config.proxy_session_count,

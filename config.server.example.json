@@ -16,6 +16,8 @@
   "include_site_homepage_seed": true,
   "enable_generic_interactions": true,
   "max_interaction_clicks_per_page": 18,
+  "enable_cbpt_portal_ajax_expansion": true,
+  "max_cbpt_portal_ajax_requests_per_page": 16,
   "max_api_pages_per_series": 0,
   "proxy_session_count": 8,
   "skip_failed_proxies": true,
