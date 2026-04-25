@@ -1179,6 +1179,15 @@ class SiteCrawler:
             candidate = urljoin(base_url, candidate)
 
         parts = urlsplit(candidate)
+        embedded_broken_absolute_match = None
+        if parts.scheme in {"http", "https"} and parts.hostname:
+            embedded_broken_absolute_match = re.search(r"(?i)/(?:.*?/)?(?P<scheme>https?):/(?P<rest>[^/].*)$", parts.path)
+        if embedded_broken_absolute_match is not None:
+            candidate = "{0}://{1}".format(
+                embedded_broken_absolute_match.group("scheme").lower(),
+                embedded_broken_absolute_match.group("rest").lstrip("/"),
+            )
+            parts = urlsplit(candidate)
         if parts.scheme not in {"http", "https", "blob"}:
             return None
         if parts.scheme == "blob":
