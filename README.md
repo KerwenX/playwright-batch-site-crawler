@@ -25,6 +25,7 @@
 - 外站 URL、下载资源、明显危险动作 URL 只记录，不继续访问。
 - 已访问 URL 不会重复入队，避免死循环。
 - 页面存在交互、弹窗、AJAX 分页时，会尽量展开后继续发现 URL。
+- 发现队列会优先调度更像目录页、正文页、期次页的 URL；明显低价值的统计、下载控制、样式、登录类链接会延后，避免抢占前几页的访问预算。
 - 高并发模式下支持多站点并行、站内动态 worker 调度、共享 Playwright 驱动。
 - checkpoint 会额外带上“正在跑但尚未落盘”的页面，避免中断时丢失 in-flight URL。
 
@@ -39,6 +40,9 @@
   - 会从同站 JS bundle 中提取 `path:\"/foo\"` 这类路由
   - 对 hash SPA 会自动转成 `#/foo`
   - 可以避免“首页几乎没有 DOM 链接，导致只抓到根页”的问题
+- 通用 URL 清洗与队列优先级
+  - 会尽量剔除 HTML 标签误判、坏格式相对链接、明显的统计/下载控制接口
+  - 即使某些低价值 URL 不继续访问，也仍然会完整记录在发现结果里
 
 #### 1.1 Boyuan / `uniapp.boyuancb.com` 类站点
 
@@ -177,6 +181,8 @@ docker run --rm -it \
 
 - `input_urls_file`
   批量种子 URL 文件，一行一个 URL。
+- 配置文件和输入文件支持 `UTF-8` 与 `UTF-8 with BOM`
+  在 Windows 上直接用记事本或 PowerShell 写文件也能正常读取。
 - `output_root`
   输出根目录。
 - `chromium_executable_path`
@@ -251,6 +257,7 @@ https://gggl.cbpt.cnki.net/portal
 规则：
 
 - 同一站点如果在输入文件中出现多次，只会生成一个站点任务。
+- 如果某个站点之前已经 `completed = true`，但你后来又往 `input_urls.txt` 里增加了新的同站点 seed，程序会自动恢复这个站点任务并合并新 seed，不会因为旧 checkpoint 而整站跳过。
 - 站点目录名按 host 转为下划线格式。
 - 例如 `www.baidu.com` 会输出到 `www_baidu_com/`。
 
@@ -283,6 +290,7 @@ python3 server_batch_crawler.py
 - 程序中断后再次运行，会从检查点继续。
 - 已访问 URL 不会重复入队。
 - 已完成站点默认会跳过。
+- 但如果同一站点新增了 seed URL，即使旧 checkpoint 已完成，也会自动恢复该站点并把新 seed 并入同一个站点目录继续挖掘。
 - 当爬取策略版本升级后，旧检查点会自动识别为“需要继续补跑”。
 - 正在访问中的页面也会写入 checkpoint；异常退出后会重新入队，不会因为调度中的页面丢失覆盖。
 - 无论是否启用轻量 checkpoint，都会持续追加：
@@ -345,22 +353,26 @@ crawl_output_batch/
 
 ## 本次通用站点验证
 
-2026 年 4 月 21 日，我用本地 `Python 3.14 + Playwright` 对下面三个站点做了限额回归：
+2026 年 4 月 26 日，我用本地 `Python 3.14 + Playwright` 对下面三个站点做了限额回归：
 
-- `http://www.chinacirculation.org`
 - `http://www.cpedm.com`
 - `http://www.cssm.com.cn`
+- `https://zgncjj.ajcass.com/#/`
 
-在 `max_pages_per_site = 8`、`write_full_outputs_on_checkpoint = false` 的 smoke 配置下，结果是：
+在 `max_pages_per_site = 6`、`write_full_outputs_on_checkpoint = true` 的 smoke 配置下，结果是：
 
-- `chinacirculation`：`496` discovered，`235` queueable，`8` visited
-- `cpedm`：`429` discovered，`309` queueable，`8` visited
-- `cssm`：`192` discovered，`144` queueable，`8` visited
+- `cpedm`：`777` discovered，`333` queueable，`6` visited
+- `cssm`：`254` discovered，`209` queueable，`6` visited
+- `zgncjj`：`452` discovered，`340` queueable，`6` visited
 
-其中 `chinacirculation` 的提升最明显：
+这轮重点验证了三件事：
 
-- 改造前：可继续访问的 URL 极少，容易表现成“只抓到首页”
-- 改造后：已经能自动产出大量 `#/browse?year=...&issue=...` 与 `#/browse_details?...` URL
+- `cpedm`
+  已确认会从首页进入 `CN/1000-0747/home.shtml`，并优先继续下钻到 `CN/Y2000/V27/I1`、`CN/Y2000/V27/I2` 这类期次页，而不是先被 `articleDownloadControl`、点击量统计接口抢占预算。
+- `cssm`
+  已确认会优先访问 `/ch/index.aspx`、`/ch/reader/current.aspx`、`more_news_list.aspx`、`view_news.aspx`，而不是优先跑 `css.aspx` 之类低价值页面。
+- `zgncjj`
+  已确认本地依然能稳定发现大量 `#/search?...` 与 `#/issueDetail?...`，并继续通过 AJCASS 接口向下展开；同时已经压掉此前那类 `https://zgncjj.ajcass.com/span`、`/em`、`/li` 这类伪 URL 噪声。
 
 ## 本次 `gggl` 本地验证
 

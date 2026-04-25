@@ -183,6 +183,67 @@ UNSAFE_ACTION_QUERY_PAIRS = {
     ("op", "delete"),
     ("op", "logout"),
 }
+HTML_TAGLIKE_PATH_SEGMENTS = {
+    "a",
+    "b",
+    "br",
+    "dd",
+    "div",
+    "dl",
+    "dt",
+    "em",
+    "font",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "hr",
+    "i",
+    "img",
+    "li",
+    "ol",
+    "p",
+    "small",
+    "span",
+    "strong",
+    "sub",
+    "sup",
+    "table",
+    "tbody",
+    "td",
+    "th",
+    "thead",
+    "tr",
+    "u",
+    "ul",
+}
+NON_NAVIGATIONAL_ENDPOINT_FILENAMES = {
+    "articledownloadcontrol.do",
+    "existscnctstinarticle.do",
+    "exportcitation.do",
+    "getdianjishu.jsp",
+    "getdianjirichhtmlshu.jsp",
+    "getxiazaishu.jsp",
+    "showalertinfo.do",
+}
+LOW_PRIORITY_NAVIGATION_FILENAMES = {
+    "component.do",
+    "css.aspx",
+    "login.aspx",
+    "register_note.aspx",
+}
+LOW_PRIORITY_NAVIGATION_SEGMENTS = {
+    "auditor",
+    "login",
+    "register",
+    "signin",
+    "signup",
+}
+LOW_PRIORITY_NAVIGATION_PREFIXES = (
+    "/uploadfile",
+)
 DEFAULT_BROWSER_LAUNCH_ARGS = [
     "--disable-blink-features=AutomationControlled",
     "--disable-gpu",
@@ -303,7 +364,7 @@ class BatchConfig:
 
     @classmethod
     def from_file(cls, path: Union[str, Path]) -> "BatchConfig":
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        payload = json.loads(Path(path).read_text(encoding="utf-8-sig"))
         base_dir = Path(path).resolve().parent
         return cls(
             input_urls_file=str(payload.get("input_urls_file", DEFAULT_INPUT_URLS_FILE)),
@@ -555,6 +616,58 @@ def is_probably_unsafe_action_url(url: str) -> bool:
     return False
 
 
+def get_path_segments(path: str) -> List[str]:
+    return [segment for segment in (path or "").lower().split("/") if segment]
+
+
+def get_path_filename(path: str) -> str:
+    segments = get_path_segments(path)
+    return segments[-1] if segments else ""
+
+
+def is_html_tag_like_path(path: str) -> bool:
+    cleaned = (path or "").strip()
+    if not cleaned:
+        return False
+    if cleaned.startswith("#"):
+        cleaned = cleaned[1:]
+    if cleaned.startswith("//"):
+        return False
+    while cleaned.startswith(("./", "../")):
+        cleaned = cleaned[2:] if cleaned.startswith("./") else cleaned[3:]
+    if cleaned.startswith("/"):
+        cleaned = cleaned[1:]
+    cleaned = cleaned.split("?", 1)[0].split("#", 1)[0].strip("/")
+    if not cleaned or "/" in cleaned:
+        return False
+    return cleaned.lower() in HTML_TAGLIKE_PATH_SEGMENTS
+
+
+def is_probably_non_navigational_endpoint(url: str) -> bool:
+    parts = urlsplit(url)
+    lowered_path = parts.path.lower()
+    filename = get_path_filename(lowered_path)
+    if any(lowered_path.startswith(prefix) for prefix in LOW_PRIORITY_NAVIGATION_PREFIXES):
+        return True
+    if filename in NON_NAVIGATIONAL_ENDPOINT_FILENAMES:
+        return True
+    return False
+
+
+def is_probably_low_priority_navigation_url(url: str) -> bool:
+    parts = urlsplit(url)
+    lowered_path = parts.path.lower()
+    filename = get_path_filename(lowered_path)
+    segments = get_path_segments(lowered_path)
+    if any(lowered_path.startswith(prefix) for prefix in LOW_PRIORITY_NAVIGATION_PREFIXES):
+        return True
+    if filename in LOW_PRIORITY_NAVIGATION_FILENAMES:
+        return True
+    if any(segment in LOW_PRIORITY_NAVIGATION_SEGMENTS for segment in segments):
+        return True
+    return False
+
+
 def checkpoint_matches_current_policy(checkpoint: Dict[str, Any], visit_leaf_pages: bool) -> bool:
     saved_version = int(checkpoint.get("crawl_policy_version", 0) or 0)
     saved_visit_leaf_pages = bool(checkpoint.get("visit_leaf_pages", False))
@@ -597,7 +710,7 @@ def load_seed_urls(path: Path) -> List[str]:
     if not path.exists():
         raise FileNotFoundError(f"Input URL file not found: {path}")
     urls: List[str] = []
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
+    for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
@@ -605,6 +718,15 @@ def load_seed_urls(path: Path) -> List[str]:
         if normalized:
             urls.append(normalized)
     return urls
+
+
+def normalize_seed_url_set(urls: List[str]) -> Set[str]:
+    normalized: Set[str] = set()
+    for url in urls:
+        value = normalize_seed_url(url)
+        if value:
+            normalized.add(value)
+    return normalized
 
 
 def group_urls_by_site(urls: List[str], include_homepage_seed: bool) -> Dict[str, Dict[str, Any]]:
@@ -1039,6 +1161,12 @@ class SiteCrawler:
         candidate = raw_url.strip()
         if not candidate:
             return None
+        broken_absolute_match = re.search(r"(?i)(?:^|/)(?P<scheme>https?):/(?P<rest>[^/].*)$", candidate)
+        if broken_absolute_match and "://" not in candidate:
+            candidate = "{0}://{1}".format(
+                broken_absolute_match.group("scheme").lower(),
+                broken_absolute_match.group("rest").lstrip("/"),
+            )
         lowered = candidate.lower()
         if lowered.startswith(("javascript:", "mailto:", "tel:", "data:")):
             return None
@@ -1538,6 +1666,8 @@ class SiteCrawler:
             return False
         if is_probably_unsafe_action_url(normalized):
             return False
+        if is_probably_non_navigational_endpoint(normalized):
+            return False
         if self.site_family == "cbpt_cnki":
             lowered_path = parts.path.lower()
             if (
@@ -1578,6 +1708,70 @@ class SiteCrawler:
         }:
             return False
         return True
+
+    def discovery_method_priority(self, method: str) -> int:
+        lowered = (method or "").lower()
+        if lowered == "seed":
+            return 0
+        if lowered == "dom":
+            return 1
+        if lowered.startswith("api:"):
+            return 2
+        if lowered.startswith(("click", "popup:", "selector:")):
+            return 3
+        if lowered.startswith("response:document"):
+            return 4
+        if lowered.startswith("response:script"):
+            return 5
+        if lowered.startswith("response:json"):
+            return 6
+        if lowered.startswith(("response:xhr", "response:fetch")):
+            return 7
+        if lowered.startswith("download:"):
+            return 9
+        return 8
+
+    def discovery_priority(self, raw_url: str, method: str) -> tuple[Any, ...]:
+        normalized = self.normalize_url(raw_url) or raw_url
+        page_kind = self.page_kind(normalized) if self.is_queueable(normalized) else "resource"
+        kind_rank = {
+            "root": 0,
+            "issue_search": 0,
+            "english_index": 0,
+            "cbpt_list": 0,
+            "cbpt_portal_index": 0,
+            "cbpt_portal_list": 0,
+            "detail": 1,
+            "issue_detail": 1,
+            "english_issue": 1,
+            "cbpt_article": 1,
+            "cbpt_portal_article": 1,
+            "cbpt_portal_news": 1,
+            "page": 2,
+            "cbpt_portal_aux": 3,
+            "cbpt_aux": 3,
+            "resource": 4,
+        }.get(page_kind, 2)
+        path_depth = len(get_path_segments(urlsplit(normalized).path))
+        low_value_rank = 1 if is_probably_low_priority_navigation_url(normalized) else 0
+        return (
+            low_value_rank,
+            kind_rank,
+            self.discovery_method_priority(method),
+            -path_depth,
+            normalized,
+        )
+
+    def prioritize_discoveries(self, discoveries: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        unique: list[tuple[str, str]] = []
+        seen: Set[tuple[str, str]] = set()
+        for raw_url, method in discoveries:
+            key = (raw_url, method)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append((raw_url, method))
+        return sorted(unique, key=lambda item: self.discovery_priority(item[0], item[1]))
 
     def build_ajcass_issue_url(
         self,
@@ -1886,6 +2080,9 @@ class SiteCrawler:
                 [
                     ("[class*='title'], [class*='author'], [class*='article'], [class*='issue'], [class*='card']", "selector:generic-content", 10),
                     (".swiper-slide, [class*='swiper-slide']", "selector:generic-swiper", 8),
+                    ("[data-url], [data-href], [data-link], [data-target-url]", "selector:generic-data-url", 8),
+                    ("summary, details summary, [aria-expanded='false']", "selector:generic-expand", 4),
+                    ("[class*='menu'] [onclick], [class*='nav'] [onclick], [class*='list'] [onclick]", "selector:generic-onclick", 8),
                 ]
             )
 
@@ -1932,6 +2129,8 @@ class SiteCrawler:
             return None
         if cleaned.startswith("/") and len(cleaned) <= 4 and cleaned.strip("/").isdigit():
             return None
+        if is_html_tag_like_path(cleaned):
+            return None
         if cleaned in {"", "/", "//", "?", "./", "../"}:
             return None
         return cleaned
@@ -1968,6 +2167,44 @@ class SiteCrawler:
                 results.append(candidate)
         return results
 
+    def should_extract_relative_urls_from_text(self, value: str) -> bool:
+        candidate = (value or "").strip()
+        if not candidate:
+            return False
+        lowered = candidate.lower()
+        if candidate.startswith(("//", "/", "./", "../", "?", "#/")):
+            return True
+        if any(
+            marker in lowered
+            for marker in (
+                "href=",
+                "src=",
+                "action=",
+                "data-href",
+                "data-url",
+                "data-src",
+                "location.href",
+                "window.location",
+                "open(",
+            )
+        ):
+            return True
+        return any(
+            token in lowered
+            for token in (
+                ".aspx",
+                ".do?",
+                ".do&",
+                ".do#",
+                ".html",
+                ".htm",
+                ".jsp",
+                ".php",
+                ".shtml",
+                "#/",
+            )
+        )
+
     def iter_string_urls(self, value: Any) -> list[str]:
         results: list[str] = []
         if isinstance(value, dict):
@@ -1977,7 +2214,19 @@ class SiteCrawler:
             for nested in value:
                 results.extend(self.iter_string_urls(nested))
         elif isinstance(value, str):
-            results.extend(self.extract_urls_from_string(value, allow_relative=True))
+            text = value.strip()
+            if not text:
+                return results
+            if "<" in text and ">" in text:
+                results.extend(self.extract_urls_from_html_fragment(text))
+                results.extend(self.extract_urls_from_string(text, allow_relative=False))
+            else:
+                results.extend(
+                    self.extract_urls_from_string(
+                        text,
+                        allow_relative=self.should_extract_relative_urls_from_text(text),
+                    )
+                )
         return results
 
     def parse_ajcass_issue_items(
@@ -2660,7 +2909,7 @@ class SiteCrawler:
                             exc_info=(type(result), result, result.__traceback__),
                         )
 
-            for raw_url, method in discoveries:
+            for raw_url, method in self.prioritize_discoveries(discoveries):
                 self.enqueue_url(raw_url, item.depth + 1, page.url, method)
 
             visit.ok = True
@@ -3051,7 +3300,10 @@ class BatchRunner:
             return None
         checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
         policy_matches = checkpoint_matches_current_policy(checkpoint, self.batch_config.visit_leaf_pages)
-        if checkpoint.get("completed") and self.batch_config.skip_completed_sites and policy_matches:
+        checkpoint_seed_urls = normalize_seed_url_set(checkpoint.get("seed_urls", []))
+        current_seed_urls = normalize_seed_url_set(site_config.seed_urls)
+        new_seed_urls = sorted(current_seed_urls - checkpoint_seed_urls)
+        if checkpoint.get("completed") and self.batch_config.skip_completed_sites and policy_matches and not new_seed_urls:
             summary_path = site_config.output_dir / "summary.json"
             self.logger.info(
                 "Skipping completed site site=%s checkpoint=%s",
@@ -3067,6 +3319,13 @@ class BatchRunner:
                 "seed_urls": site_config.seed_urls,
                 "completed": True,
             }
+        if checkpoint.get("completed") and self.batch_config.skip_completed_sites and policy_matches and new_seed_urls:
+            self.logger.info(
+                "Completed checkpoint has new seed URLs; resuming site site=%s checkpoint=%s new_seeds=%s",
+                site_config.site_key,
+                checkpoint_path,
+                new_seed_urls,
+            )
         if checkpoint.get("completed") and self.batch_config.skip_completed_sites and not policy_matches:
             self.logger.info(
                 "Checkpoint policy changed; resuming site site=%s checkpoint=%s old_version=%s new_version=%s old_visit_leaf_pages=%s new_visit_leaf_pages=%s",
