@@ -100,6 +100,17 @@
 - Hash 路由 SPA
 - 英文页、期次页、文章页
 - 接口驱动的目录页发现
+- 传统 CMS 期刊站，如 `jjgl.ajcass.com`
+  - `Magazine/MagazinePicList`
+  - `Magazine/GetIssueContentList`
+  - `Magazine/Show/{id}`
+  - `CommonBlock/GetSiteDescribeDetail`
+  - `CommonBlock/SiteContentList`
+  - `CommonBlock/SiteContentDetail*`
+- 自动检测并尝试通过 `waf_slider_verify.html` 滑块验证页
+  - 适用于这类站点中“期次目录页被 WAF 拦截、文章详情页未拦截”的情况
+  - 成功后会继续在真实 `GetIssueContentList` 页面里提取 `Magazine/Show/*` 文章链接
+  - 如果升级后旧站点此前已跑成 `completed = true`，由于抓取策略版本提升，重新运行时会自动补跑
 
 ### 3. `*.cbpt.cnki.net`
 
@@ -279,6 +290,12 @@ docker run --rm -it \
   是否启用 `cbpt portal` 页面的 AJAX 分页展开。
 - `max_cbpt_portal_ajax_requests_per_page`
   每个 `cbpt portal` 页面最多额外展开多少个 AJAX 分页请求。
+- `enable_waf_slider_solver`
+  是否启用 `waf_slider_verify.html` 自动滑块放行。
+- `max_waf_slider_attempts`
+  单个页面最多尝试多少轮滑块放行。
+- `waf_slider_candidate_count`
+  每轮从 canvas 图像里保留多少个候选缺口位置；默认只实际尝试当前最佳候选，失败后会重新估计下一轮验证码。
 - `proxy_servers`
   代理池，可为字符串列表，也可为对象列表。
 - `proxy_session_count`

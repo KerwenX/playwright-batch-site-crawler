@@ -4,6 +4,7 @@ import asyncio
 import html as html_lib
 import json
 import math
+import random
 import re
 import time
 import traceback
@@ -283,6 +284,8 @@ class SiteCrawler:
         lowered_url = (self.normalize_url(url) or url).lower()
         path = urlsplit(lowered_url).path
         if kind in {
+            "ajcass_cms_article",
+            "ajcass_cms_detail",
             "detail",
             "issue_detail",
             "english_issue",
@@ -301,6 +304,9 @@ class SiteCrawler:
             if any(token in lowered_url for token in ("articledetail", "paperid=", "contentid=", "articleid=", "newsid=", "detailid=")):
                 return "light"
         if kind in {
+            "ajcass_cms_archive",
+            "ajcass_cms_issue",
+            "ajcass_cms_list",
             "root",
             "issue_search",
             "english_index",
@@ -346,13 +352,23 @@ class SiteCrawler:
     def pop_next_dispatchable_item(self) -> Optional[Tuple[QueueItem, str]]:
         if not self.frontier:
             return None
+        best_index: Optional[int] = None
+        best_workload_class = ""
+        best_priority: Optional[Tuple[Any, ...]] = None
         for index, item in enumerate(self.frontier):
             workload_class = self.page_workload_class(item.url)
-            if self.can_dispatch_workload(workload_class):
-                self.frontier.rotate(-index)
-                selected_item = self.frontier.popleft()
-                self.frontier.rotate(index)
-                return selected_item, workload_class
+            if not self.can_dispatch_workload(workload_class):
+                continue
+            priority = self.discovery_priority(item.url, item.discovery_method)
+            if best_index is None or priority < best_priority:
+                best_index = index
+                best_workload_class = workload_class
+                best_priority = priority
+        if best_index is not None:
+            self.frontier.rotate(-best_index)
+            selected_item = self.frontier.popleft()
+            self.frontier.rotate(best_index)
+            return selected_item, best_workload_class
         return None
 
     def frontier_count(self) -> int:
@@ -971,6 +987,21 @@ class SiteCrawler:
             return "unknown"
         parts = urlsplit(normalized)
         if self.is_ajcass and parts.hostname == self.site_host:
+            lowered_path = parts.path.lower()
+            if lowered_path == "/home/index":
+                return "root"
+            if lowered_path.endswith("/waf_slider_verify.html"):
+                return "guard"
+            if lowered_path.startswith("/magazine/magazinepiclist"):
+                return "ajcass_cms_archive"
+            if lowered_path.startswith("/magazine/getissuecontentlist"):
+                return "ajcass_cms_issue"
+            if "/magazine/show/" in lowered_path:
+                return "ajcass_cms_article"
+            if lowered_path.startswith("/commonblock/sitecontentlist"):
+                return "ajcass_cms_list"
+            if lowered_path.startswith("/commonblock/getsitedescribedetail") or lowered_path.startswith("/commonblock/sitecontentdetail"):
+                return "ajcass_cms_detail"
             route = self.ajcass_route_from_url(normalized)
             if route in {"", "/", "/index"} and parts.path == "/":
                 return "root"
@@ -1085,6 +1116,8 @@ class SiteCrawler:
                 or lowered_path.endswith("/client/paperpage_list")
             ):
                 return False
+        if self.is_ajcass and parts.path.lower().endswith("/waf_slider_verify.html"):
+            return False
         if self.is_ajcass and parts.fragment:
             return self.ajcass_route_from_url(normalized).startswith("/")
         return True
@@ -1134,11 +1167,16 @@ class SiteCrawler:
         page_kind = self.page_kind(normalized) if self.is_queueable(normalized) else "resource"
         kind_rank = {
             "root": 0,
+            "ajcass_cms_archive": 0,
+            "ajcass_cms_issue": 0,
             "issue_search": 0,
             "english_index": 0,
             "cbpt_list": 0,
             "cbpt_portal_index": 0,
             "cbpt_portal_list": 0,
+            "ajcass_cms_list": 1,
+            "ajcass_cms_article": 2,
+            "ajcass_cms_detail": 2,
             "detail": 1,
             "issue_detail": 1,
             "english_issue": 1,
@@ -1156,7 +1194,7 @@ class SiteCrawler:
             low_value_rank,
             kind_rank,
             self.discovery_method_priority(method),
-            -path_depth,
+            path_depth,
             normalized,
         )
 
@@ -1296,6 +1334,200 @@ class SiteCrawler:
                 pass
         if settle_ms > 0:
             await page.wait_for_timeout(settle_ms)
+
+    async def is_waf_slider_challenge_page(self, page: Page) -> bool:
+        try:
+            return bool(
+                await page.evaluate(
+                    """() => {
+                        const path = String(location.pathname || '').toLowerCase();
+                        return path.endsWith('/waf_slider_verify.html')
+                            || (!!window.sliderCaptcha
+                                && !!document.querySelector('.slider')
+                                && !!document.querySelector('.sliderContainer')
+                                && !!document.querySelector('canvas.block'));
+                    }"""
+                )
+            )
+        except Exception:
+            return False
+
+    async def estimate_waf_slider_offsets(self, page: Page, candidate_count: int) -> list[int]:
+        try:
+            offsets = await page.evaluate(
+                """(candidateCount) => {
+                    const bg = Array.from(document.querySelectorAll('canvas')).find(canvas => !canvas.classList.contains('block'));
+                    const block = document.querySelector('canvas.block');
+                    if (!bg || !block) return [];
+                    const bgCtx = bg.getContext('2d');
+                    const blockCtx = block.getContext('2d');
+                    if (!bgCtx || !blockCtx) return [];
+                    const bgImage = bgCtx.getImageData(0, 0, bg.width, bg.height).data;
+                    const blockImage = blockCtx.getImageData(0, 0, block.width, block.height).data;
+                    let minX = block.width;
+                    let maxX = -1;
+                    let minY = block.height;
+                    let maxY = -1;
+                    for (let y = 0; y < block.height; y += 1) {
+                        for (let x = 0; x < block.width; x += 1) {
+                            const alpha = blockImage[(y * block.width + x) * 4 + 3];
+                            if (alpha <= 0) continue;
+                            if (x < minX) minX = x;
+                            if (x > maxX) maxX = x;
+                            if (y < minY) minY = y;
+                            if (y > maxY) maxY = y;
+                        }
+                    }
+                    if (maxX < minX || maxY < minY) return [];
+                    const pieceWidth = maxX - minX + 1;
+                    const pieceHeight = maxY - minY + 1;
+                    if (pieceWidth < 20 || pieceHeight < 20) return [];
+
+                    const mask = [];
+                    const piece = [];
+                    for (let y = minY; y <= maxY; y += 1) {
+                        for (let x = minX; x <= maxX; x += 1) {
+                            const index = (y * block.width + x) * 4;
+                            const alpha = blockImage[index + 3];
+                            const active = alpha > 0;
+                            mask.push(active);
+                            piece.push(blockImage[index], blockImage[index + 1], blockImage[index + 2]);
+                        }
+                    }
+
+                    const scores = [];
+                    for (let offset = 0; offset <= bg.width - pieceWidth; offset += 1) {
+                        let sum = 0;
+                        let activePixels = 0;
+                        let pieceIndex = 0;
+                        let maskIndex = 0;
+                        for (let y = 0; y < pieceHeight; y += 1) {
+                            const bgRowBase = ((minY + y) * bg.width + offset) * 4;
+                            for (let x = 0; x < pieceWidth; x += 1) {
+                                const active = mask[maskIndex];
+                                maskIndex += 1;
+                                if (!active) {
+                                    pieceIndex += 3;
+                                    continue;
+                                }
+                                const bgIndex = bgRowBase + x * 4;
+                                const dr = Math.abs(bgImage[bgIndex] - piece[pieceIndex]);
+                                const dg = Math.abs(bgImage[bgIndex + 1] - piece[pieceIndex + 1]);
+                                const db = Math.abs(bgImage[bgIndex + 2] - piece[pieceIndex + 2]);
+                                pieceIndex += 3;
+                                sum += dr + dg + db;
+                                activePixels += 1;
+                            }
+                        }
+                        if (activePixels > 0) {
+                            scores.push({ offset, score: sum / activePixels });
+                        }
+                    }
+                    scores.sort((left, right) => left.score - right.score);
+                    return scores
+                        .slice(0, Math.max(1, candidateCount))
+                        .map(item => Math.round(item.offset))
+                        .filter((value, index, array) => array.indexOf(value) === index);
+                }""",
+                max(1, candidate_count),
+            )
+        except Exception as exc:
+            self.logger.debug("Failed to estimate WAF slider offsets current=%s error=%s", page.url, exc)
+            return []
+        if not isinstance(offsets, list):
+            return []
+        return [int(value) for value in offsets if isinstance(value, (int, float)) and int(value) > 4]
+
+    async def drag_waf_slider(self, page: Page, offset: int) -> None:
+        slider = page.locator(".slider")
+        box = await slider.bounding_box()
+        if not box:
+            raise RuntimeError("Unable to locate WAF slider handle.")
+        start_x = box["x"] + random.uniform(max(8.0, box["width"] * 0.25), min(box["width"] - 8.0, box["width"] * 0.7))
+        start_y = box["y"] + random.uniform(max(8.0, box["height"] * 0.25), min(box["height"] - 8.0, box["height"] * 0.7))
+        await page.mouse.move(start_x, start_y)
+        await page.wait_for_timeout(random.randint(80, 180))
+        await page.mouse.down()
+        await page.wait_for_timeout(random.randint(120, 220))
+
+        steps = random.randint(25, 40)
+        overshoot = random.uniform(2.0, 8.0)
+        target = float(offset) + overshoot
+        for step in range(1, steps + 1):
+            progress = step / steps
+            eased = 1.0 - (1.0 - progress) * (1.0 - progress)
+            x = start_x + target * eased
+            y = start_y + math.sin(progress * math.pi) * random.uniform(-1.5, 1.5) + random.uniform(-0.5, 0.5)
+            await page.mouse.move(x, y, steps=1)
+            await page.wait_for_timeout(random.randint(10, 30))
+
+        await page.mouse.move(
+            start_x + float(offset) + random.uniform(-1.5, 1.5),
+            start_y + random.uniform(-0.5, 0.5),
+            steps=1,
+        )
+        await page.wait_for_timeout(random.randint(80, 150))
+        await page.mouse.up()
+        await page.wait_for_timeout(2500)
+
+    async def solve_waf_slider_challenge(self, page: Page, requested_url: str, workload_class: str) -> bool:
+        if not self.config.enable_waf_slider_solver or self.config.max_waf_slider_attempts <= 0:
+            return False
+        if not await self.is_waf_slider_challenge_page(page):
+            return True
+
+        self.logger.warning(
+            "Detected WAF slider challenge requested=%s current=%s attempts=%s",
+            requested_url,
+            page.url,
+            self.config.max_waf_slider_attempts,
+        )
+        for attempt in range(1, self.config.max_waf_slider_attempts + 1):
+            offsets = await self.estimate_waf_slider_offsets(page, self.config.waf_slider_candidate_count)
+            if not offsets:
+                self.logger.warning(
+                    "WAF slider estimate unavailable attempt=%s requested=%s current=%s",
+                    attempt,
+                    requested_url,
+                    page.url,
+                )
+                await page.wait_for_timeout(800)
+                continue
+            self.logger.info(
+                "WAF slider attempt=%s requested=%s current=%s candidates=%s",
+                attempt,
+                requested_url,
+                page.url,
+                offsets,
+            )
+            try:
+                await self.drag_waf_slider(page, offsets[0])
+            except Exception as exc:
+                self.logger.warning(
+                    "WAF slider drag failed attempt=%s requested=%s current=%s error=%s",
+                    attempt,
+                    requested_url,
+                    page.url,
+                    exc,
+                )
+                await page.wait_for_timeout(1000)
+                continue
+            if not await self.is_waf_slider_challenge_page(page):
+                await self.settle_page(page, workload_class, self.page_kind(page.url))
+                self.logger.info(
+                    "WAF slider solved attempt=%s requested=%s final=%s",
+                    attempt,
+                    requested_url,
+                    page.url,
+                )
+                return True
+            self.logger.warning(
+                "WAF slider attempt failed attempt=%s requested=%s current=%s",
+                attempt,
+                requested_url,
+                page.url,
+            )
+        return False
 
     async def fetch_json_via_browser(self, page: Page, url: str, method: str = "GET", data: Optional[Dict[str, Any]] = None) -> Any:
         payload = await page.evaluate(
@@ -2423,6 +2655,10 @@ class SiteCrawler:
         try:
             await page.goto(item.url, wait_until="domcontentloaded")
             await self.settle_page(page, workload_class, visit.page_kind)
+            if await self.is_waf_slider_challenge_page(page):
+                solved = await self.solve_waf_slider_challenge(page, item.url, workload_class)
+                if not solved:
+                    raise RuntimeError("Unable to solve WAF slider challenge for {0}".format(item.url))
 
             visit.final_url = page.url
             visit.page_kind = self.page_kind(page.url)
@@ -2673,6 +2909,9 @@ class SiteCrawler:
                 "write_full_outputs_on_checkpoint": self.config.write_full_outputs_on_checkpoint,
                 "enable_cbpt_portal_ajax_expansion": self.config.enable_cbpt_portal_ajax_expansion,
                 "max_cbpt_portal_ajax_requests_per_page": self.config.max_cbpt_portal_ajax_requests_per_page,
+                "enable_waf_slider_solver": self.config.enable_waf_slider_solver,
+                "max_waf_slider_attempts": self.config.max_waf_slider_attempts,
+                "waf_slider_candidate_count": self.config.waf_slider_candidate_count,
             },
             "verification": {
                 "expected_issue_search_urls": len(self.expected_issue_search_urls),

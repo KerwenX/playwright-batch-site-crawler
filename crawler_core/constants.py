@@ -4,7 +4,7 @@ import re
 
 DEFAULT_CONFIG_PATH = "config.json"
 DEFAULT_INPUT_URLS_FILE = "input_urls.txt"
-CRAWL_POLICY_VERSION = 3
+CRAWL_POLICY_VERSION = 4
 AJCASS_HOST = "zgncjj.ajcass.com"
 AJCASS_HOST_SUFFIX = ".ajcass.com"
 AJCASS_SITE_CONTENT_API = "https://api.ajcass.com/api/JournalInfoApi/GetSiteContentPageList"
@@ -201,6 +201,8 @@ NON_NAVIGATIONAL_ENDPOINT_FILENAMES = {
     "getdianjirichhtmlshu.jsp",
     "getxiazaishu.jsp",
     "showalertinfo.do",
+    "waf_slider_captcha",
+    "waf_slider_verify.html",
 }
 LOW_PRIORITY_NAVIGATION_FILENAMES = {
     "component.do",

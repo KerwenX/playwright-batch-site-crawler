@@ -28,6 +28,9 @@
   "enable_cbpt_portal_ajax_expansion": true,
   "max_cbpt_portal_ajax_requests_per_page": 12,
   "max_api_pages_per_series": 0,
+  "enable_waf_slider_solver": true,
+  "max_waf_slider_attempts": 12,
+  "waf_slider_candidate_count": 5,
   "proxy_session_count": 3,
   "skip_failed_proxies": true,
   "proxy_servers": [

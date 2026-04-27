@@ -86,6 +86,9 @@ class BatchConfig:
     enable_cbpt_portal_ajax_expansion: bool = True
     max_cbpt_portal_ajax_requests_per_page: int = 12
     max_api_pages_per_series: int = 0
+    enable_waf_slider_solver: bool = True
+    max_waf_slider_attempts: int = 12
+    waf_slider_candidate_count: int = 5
     proxy_servers: List[Dict[str, str]] = field(default_factory=list)
     proxy_session_count: int = 0
     skip_failed_proxies: bool = True
@@ -128,6 +131,9 @@ class BatchConfig:
             enable_cbpt_portal_ajax_expansion=bool(payload.get("enable_cbpt_portal_ajax_expansion", True)),
             max_cbpt_portal_ajax_requests_per_page=max(0, int(payload.get("max_cbpt_portal_ajax_requests_per_page", 12))),
             max_api_pages_per_series=max(0, int(payload.get("max_api_pages_per_series", 0))),
+            enable_waf_slider_solver=bool(payload.get("enable_waf_slider_solver", True)),
+            max_waf_slider_attempts=max(0, int(payload.get("max_waf_slider_attempts", 12))),
+            waf_slider_candidate_count=max(1, int(payload.get("waf_slider_candidate_count", 5))),
             proxy_servers=load_proxy_servers(payload.get("proxy_servers")),
             proxy_session_count=max(0, int(payload.get("proxy_session_count", 0))),
             skip_failed_proxies=bool(payload.get("skip_failed_proxies", True)),
@@ -169,6 +175,9 @@ class SiteConfig:
     enable_cbpt_portal_ajax_expansion: bool
     max_cbpt_portal_ajax_requests_per_page: int
     max_api_pages_per_series: int
+    enable_waf_slider_solver: bool
+    max_waf_slider_attempts: int
+    waf_slider_candidate_count: int
     proxy_servers: List[Dict[str, str]]
     proxy_session_count: int
     skip_failed_proxies: bool
