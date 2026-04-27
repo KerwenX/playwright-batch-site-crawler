@@ -1,0 +1,112 @@
+{
+  "input_urls_file": "input_urls.txt",
+  "output_root": "/opt/huawei/data2/w00943222/spider/output",
+  "chromium_executable_path": "",
+  "log_level": "INFO",
+  "log_to_file": true,
+  "headless": true,
+  "max_concurrency": 6,
+  "max_site_concurrency": 32,
+  "max_heavy_page_concurrency": 2,
+  "max_light_page_concurrency": 6,
+  "max_pages_per_session": 3,
+  "max_api_expansion_concurrency": 12,
+  "page_timeout_ms": 35000,
+  "settle_ms": 1200,
+  "heavy_page_settle_ms": 2200,
+  "light_page_settle_ms": 450,
+  "response_grace_ms": 1600,
+  "max_pages_per_site": 0,
+  "checkpoint_every_pages": 200,
+  "checkpoint_every_seconds": 240,
+  "write_full_outputs_on_checkpoint": false,
+  "skip_completed_sites": true,
+  "visit_leaf_pages": true,
+  "include_site_homepage_seed": true,
+  "enable_generic_interactions": true,
+  "max_interaction_clicks_per_page": 10,
+  "enable_cbpt_portal_ajax_expansion": true,
+  "max_cbpt_portal_ajax_requests_per_page": 12,
+  "max_api_pages_per_series": 0,
+  "proxy_session_count": 3,
+  "skip_failed_proxies": true,
+  "proxy_servers": [
+    {
+      "server": "http://proxy-ip-1:port",
+      "username": "",
+      "password": "",
+      "label": "proxy-01"
+    },
+    {
+      "server": "http://proxy-ip-2:port",
+      "username": "",
+      "password": "",
+      "label": "proxy-02"
+    },
+    {
+      "server": "http://proxy-ip-3:port",
+      "username": "",
+      "password": "",
+      "label": "proxy-03"
+    },
+    {
+      "server": "http://proxy-ip-4:port",
+      "username": "",
+      "password": "",
+      "label": "proxy-04"
+    },
+    {
+      "server": "http://proxy-ip-5:port",
+      "username": "",
+      "password": "",
+      "label": "proxy-05"
+    },
+    {
+      "server": "http://proxy-ip-6:port",
+      "username": "",
+      "password": "",
+      "label": "proxy-06"
+    },
+    {
+      "server": "http://proxy-ip-7:port",
+      "username": "",
+      "password": "",
+      "label": "proxy-07"
+    },
+    {
+      "server": "http://proxy-ip-8:port",
+      "username": "",
+      "password": "",
+      "label": "proxy-08"
+    }
+  ],
+  "browser_launch_args": [
+    "--disable-blink-features=AutomationControlled",
+    "--disable-gpu",
+    "--disable-dev-shm-usage",
+    "--incognito",
+    "--no-sandbox",
+    "--disable-setuid-sandbox"
+  ],
+  "enable_request_blocking": true,
+  "blocked_resource_types": [
+    "image",
+    "media",
+    "font",
+    "ping"
+  ],
+  "blocked_url_suffixes": [
+    ".m4s",
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".bmp",
+    ".webp",
+    ".svg",
+    ".ico",
+    ".woff",
+    ".woff2",
+    ".ttf"
+  ]
+}

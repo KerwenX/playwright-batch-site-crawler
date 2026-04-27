@@ -218,6 +218,25 @@ docker run --rm -it \
 
 服务器示例配置文件：[config.server.example.json](/D:/Desktop/qoder%20work/config.server.example.json)
 
+2000 个站点、准确率优先的大批量服务器推荐配置：
+- [config.server.2000-sites.json](/D:/Desktop/qoder%20work/config.server.2000-sites.json)
+- 这份配置按“约 8 个代理、2000 个站点、大量 JS / API 驱动站点、优先保证覆盖率”的目标来定。
+- 关键取舍是：
+  - 优先提高 `max_site_concurrency`，而不是把单站 `max_concurrency` 拉到极高。
+  - 将 `proxy_session_count` 控制在 `3`，避免 2000 站点场景下每个站点都起太多 browser session。
+  - 用 `max_heavy_page_concurrency = 2` 控制目录页/期次页的深挖速度，用 `max_light_page_concurrency = 6` 放开正文和详情页的吞吐。
+  - 用 `response_grace_ms = 1600` 和更高的 `page_timeout_ms` 保住代理环境下晚到响应的发现率。
+
+如果上线后发现服务器还有明显余量，建议按这个顺序加压：
+1. 先把 `max_site_concurrency` 从 `32` 提到 `40`
+2. 再把 `max_light_page_concurrency` 从 `6` 提到 `8`
+3. 最后再把 `max_concurrency` 从 `6` 提到 `8`
+
+如果发现覆盖率下滑，建议按这个顺序回调：
+1. 先把 `response_grace_ms` 提到 `2200`
+2. 再把 `page_timeout_ms` 提到 `45000`
+3. 再把 `max_site_concurrency` 从 `32` 降到 `24`
+
 常用字段：
 
 - `input_urls_file`
