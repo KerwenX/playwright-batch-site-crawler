@@ -29,12 +29,13 @@ class BatchRunner:
             log_file=(self.output_root / "batch.log") if self.batch_config.log_to_file else None,
         )
         self.logger.info(
-            "Batch runner initialized config=%s output_root=%s log_level=%s chromium_executable_path=%s max_site_concurrency=%s write_full_outputs_on_checkpoint=%s",
+            "Batch runner initialized config=%s output_root=%s log_level=%s chromium_executable_path=%s max_site_concurrency=%s playwright_driver_pool_size=%s write_full_outputs_on_checkpoint=%s",
             self.config_path,
             self.output_root,
             self.batch_config.log_level,
             self.batch_config.chromium_executable_path or "<playwright-default>",
             self.batch_config.max_site_concurrency,
+            self.batch_config.playwright_driver_pool_size,
             self.batch_config.write_full_outputs_on_checkpoint,
         )
 
@@ -69,6 +70,7 @@ class BatchRunner:
                     heavy_page_settle_ms=self.batch_config.heavy_page_settle_ms,
                     light_page_settle_ms=self.batch_config.light_page_settle_ms,
                     response_grace_ms=self.batch_config.response_grace_ms,
+                    transient_page_retry_limit=self.batch_config.transient_page_retry_limit,
                     page_limit=self.batch_config.max_pages_per_site,
                     checkpoint_every_pages=self.batch_config.checkpoint_every_pages,
                     checkpoint_every_seconds=self.batch_config.checkpoint_every_seconds,
@@ -82,6 +84,10 @@ class BatchRunner:
                     enable_waf_slider_solver=self.batch_config.enable_waf_slider_solver,
                     max_waf_slider_attempts=self.batch_config.max_waf_slider_attempts,
                     waf_slider_candidate_count=self.batch_config.waf_slider_candidate_count,
+                    playwright_driver_pool_size=self.batch_config.playwright_driver_pool_size,
+                    session_rebuild_retries=self.batch_config.session_rebuild_retries,
+                    session_failure_threshold=self.batch_config.session_failure_threshold,
+                    session_cooldown_seconds=self.batch_config.session_cooldown_seconds,
                     proxy_servers=self.batch_config.proxy_servers,
                     proxy_session_count=self.batch_config.proxy_session_count,
                     skip_failed_proxies=self.batch_config.skip_failed_proxies,
@@ -197,22 +203,36 @@ class BatchRunner:
             len(batch_results),
             self.batch_config.max_site_concurrency,
         )
-        shared_playwright = None
+        shared_playwright_pool: list[Playwright] = []
+        playwright_index = 0
         active_tasks: Dict[asyncio.Task[dict[str, Any]], SiteConfig] = {}
         try:
             if runnable_sites:
-                shared_playwright = await async_playwright().start()
+                driver_pool_size = max(1, min(self.batch_config.max_site_concurrency, self.batch_config.playwright_driver_pool_size))
+                self.logger.info(
+                    "Starting Playwright driver pool size=%s max_site_concurrency=%s",
+                    driver_pool_size,
+                    self.batch_config.max_site_concurrency,
+                )
+                for index in range(driver_pool_size):
+                    shared_playwright_pool.append(await async_playwright().start())
+                    self.logger.info("Playwright driver ready index=%s pool_size=%s", index + 1, driver_pool_size)
             pending_sites = deque(runnable_sites)
             while pending_sites or active_tasks:
                 while pending_sites and len(active_tasks) < self.batch_config.max_site_concurrency:
                     site_config = pending_sites.popleft()
+                    shared_playwright = None
+                    if shared_playwright_pool:
+                        shared_playwright = shared_playwright_pool[playwright_index % len(shared_playwright_pool)]
+                        playwright_index += 1
                     task = asyncio.create_task(self.run_site(site_config, shared_playwright=shared_playwright))
                     active_tasks[task] = site_config
                     self.logger.info(
-                        "Site task dispatched site=%s active_sites=%s pending_sites=%s",
+                        "Site task dispatched site=%s active_sites=%s pending_sites=%s driver_slot=%s",
                         site_config.site_key,
                         len(active_tasks),
                         len(pending_sites),
+                        ((playwright_index - 1) % len(shared_playwright_pool) + 1) if shared_playwright_pool else 0,
                     )
                 if not active_tasks:
                     break
@@ -231,7 +251,7 @@ class BatchRunner:
                         len(batch_results),
                     )
         finally:
-            if shared_playwright is not None:
+            for shared_playwright in shared_playwright_pool:
                 await shared_playwright.stop()
 
         batch_summary = self._write_global_outputs(batch_results)

@@ -16,6 +16,7 @@
   "heavy_page_settle_ms": 2200,
   "light_page_settle_ms": 450,
   "response_grace_ms": 1600,
+  "transient_page_retry_limit": 2,
   "max_pages_per_site": 0,
   "checkpoint_every_pages": 200,
   "checkpoint_every_seconds": 240,
@@ -31,6 +32,10 @@
   "enable_waf_slider_solver": true,
   "max_waf_slider_attempts": 12,
   "waf_slider_candidate_count": 5,
+  "playwright_driver_pool_size": 4,
+  "session_rebuild_retries": 2,
+  "session_failure_threshold": 2,
+  "session_cooldown_seconds": 20,
   "proxy_session_count": 3,
   "skip_failed_proxies": true,
   "proxy_servers": [

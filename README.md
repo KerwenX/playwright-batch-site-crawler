@@ -182,6 +182,8 @@ docker run --rm -it \
   ./server_batch_crawler.py
 ```
 
+高并发服务器上不要沿用 `--shm-size=1g`。如果 Chromium / BrowserContext 经常报 `Connection closed while reading from the driver`，优先把共享内存提到 `16g`、`32g`，或直接使用 `--ipc=host`。
+
 ## 高并发优化
 
 这一版针对“站点很多、需要持续跑批”的场景，核心改动有五个：
@@ -198,8 +200,10 @@ docker run --rm -it \
   页面主流程结束后会继续等待一小段时间，把慢代理下晚到的 `xhr/fetch/script` 也尽量吸收进发现结果。
 - 轻量 checkpoint
   `write_full_outputs_on_checkpoint = false` 时，周期性 checkpoint 只刷新 `summary.json` 和 `checkpoint.json`，大幅降低高并发场景下的磁盘写放大。
-- 共享 Playwright
-  批任务级只启动一次 Playwright driver，各站点复用，减少频繁启动浏览器驱动的额外开销。
+- Playwright driver 分池
+  批任务级可以启动多个 Playwright driver，把高并发站点任务分摊到多个 driver 上，降低单个 driver 被压断的概率。
+- Session 自愈与熔断
+  `BrowserContext.new_page()`、API context 或 browser 断线时，会优先自动重建 session 并重试；连续失败的 session 会进入短暂冷却，再重新参与调度。
 
 服务器建议优先从下面这组参数开始调：
 
@@ -213,6 +217,11 @@ docker run --rm -it \
 - `heavy_page_settle_ms = 2500`
 - `light_page_settle_ms = 700`
 - `response_grace_ms = 1800`
+- `transient_page_retry_limit = 2`
+- `playwright_driver_pool_size = 2`
+- `session_rebuild_retries = 2`
+- `session_failure_threshold = 2`
+- `session_cooldown_seconds = 20`
 - `checkpoint_every_pages = 100`
 - `checkpoint_every_seconds = 180`
 - `write_full_outputs_on_checkpoint = false`
@@ -237,6 +246,7 @@ docker run --rm -it \
   - 将 `proxy_session_count` 控制在 `3`，避免 2000 站点场景下每个站点都起太多 browser session。
   - 用 `max_heavy_page_concurrency = 2` 控制目录页/期次页的深挖速度，用 `max_light_page_concurrency = 6` 放开正文和详情页的吞吐。
   - 用 `response_grace_ms = 1600` 和更高的 `page_timeout_ms` 保住代理环境下晚到响应的发现率。
+  - 用 `playwright_driver_pool_size = 4` 分散共享 driver 压力；用 `transient_page_retry_limit = 2` 和 `session_rebuild_retries = 2` 吸收 `Connection closed while reading from the driver` 这类瞬时故障。
 
 如果上线后发现服务器还有明显余量，建议按这个顺序加压：
 1. 先把 `max_site_concurrency` 从 `32` 提到 `40`
@@ -278,6 +288,8 @@ docker run --rm -it \
   轻页面额外稳定等待时间。用于正文页、详情页这类低成本页面。
 - `response_grace_ms`
   页面主流程结束后的响应收尾窗口，专门用来接住代理慢、延迟高时晚到的响应。
+- `transient_page_retry_limit`
+  页面级瞬时故障重试次数。适合兜住 `new_page()`、`goto()` 等阶段的短暂断线。
 - `write_full_outputs_on_checkpoint`
   `true` 时每次 checkpoint 都会重写 `nodes/edges/visits/all_urls` 明细；`false` 时只写 `summary.json + checkpoint.json`，适合高并发服务器。
 - `visit_leaf_pages`
@@ -296,6 +308,14 @@ docker run --rm -it \
   单个页面最多尝试多少轮滑块放行。
 - `waf_slider_candidate_count`
   每轮从 canvas 图像里保留多少个候选缺口位置；默认只实际尝试当前最佳候选，失败后会重新估计下一轮验证码。
+- `playwright_driver_pool_size`
+  批任务级同时启动多少个 Playwright driver。高并发服务器上建议大于 `1`，避免所有站点都共享同一个 driver。
+- `session_rebuild_retries`
+  单次页面访问遇到 driver/browser/context 断线时，最多重建多少次 session。
+- `session_failure_threshold`
+  单个 session 连续重建失败达到多少次后进入冷却。
+- `session_cooldown_seconds`
+  session 冷却时长。冷却期间该 session 不会继续接新页面。
 - `proxy_servers`
   代理池，可为字符串列表，也可为对象列表。
 - `proxy_session_count`

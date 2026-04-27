@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,6 +17,7 @@ class QueueItem:
     depth: int
     discovered_from: str
     discovery_method: str
+    attempts: int = 0
 
 
 @dataclass
@@ -74,6 +76,7 @@ class BatchConfig:
     heavy_page_settle_ms: int = 1800
     light_page_settle_ms: int = 500
     response_grace_ms: int = 1200
+    transient_page_retry_limit: int = 1
     max_pages_per_site: int = 0
     checkpoint_every_pages: int = 10
     checkpoint_every_seconds: int = 30
@@ -89,6 +92,10 @@ class BatchConfig:
     enable_waf_slider_solver: bool = True
     max_waf_slider_attempts: int = 12
     waf_slider_candidate_count: int = 5
+    playwright_driver_pool_size: int = 1
+    session_rebuild_retries: int = 1
+    session_failure_threshold: int = 2
+    session_cooldown_seconds: int = 30
     proxy_servers: List[Dict[str, str]] = field(default_factory=list)
     proxy_session_count: int = 0
     skip_failed_proxies: bool = True
@@ -119,6 +126,7 @@ class BatchConfig:
             heavy_page_settle_ms=max(0, int(payload.get("heavy_page_settle_ms", payload.get("settle_ms", 900)))),
             light_page_settle_ms=max(0, int(payload.get("light_page_settle_ms", min(int(payload.get("settle_ms", 900)), 500)))),
             response_grace_ms=max(0, int(payload.get("response_grace_ms", 1200))),
+            transient_page_retry_limit=max(0, int(payload.get("transient_page_retry_limit", 1))),
             max_pages_per_site=int(payload.get("max_pages_per_site", 0)),
             checkpoint_every_pages=max(1, int(payload.get("checkpoint_every_pages", 10))),
             checkpoint_every_seconds=max(1, int(payload.get("checkpoint_every_seconds", 30))),
@@ -134,6 +142,10 @@ class BatchConfig:
             enable_waf_slider_solver=bool(payload.get("enable_waf_slider_solver", True)),
             max_waf_slider_attempts=max(0, int(payload.get("max_waf_slider_attempts", 12))),
             waf_slider_candidate_count=max(1, int(payload.get("waf_slider_candidate_count", 5))),
+            playwright_driver_pool_size=max(1, int(payload.get("playwright_driver_pool_size", 1))),
+            session_rebuild_retries=max(0, int(payload.get("session_rebuild_retries", 1))),
+            session_failure_threshold=max(1, int(payload.get("session_failure_threshold", 2))),
+            session_cooldown_seconds=max(1, int(payload.get("session_cooldown_seconds", 30))),
             proxy_servers=load_proxy_servers(payload.get("proxy_servers")),
             proxy_session_count=max(0, int(payload.get("proxy_session_count", 0))),
             skip_failed_proxies=bool(payload.get("skip_failed_proxies", True)),
@@ -165,6 +177,7 @@ class SiteConfig:
     heavy_page_settle_ms: int
     light_page_settle_ms: int
     response_grace_ms: int
+    transient_page_retry_limit: int
     page_limit: int
     checkpoint_every_pages: int
     checkpoint_every_seconds: int
@@ -178,6 +191,10 @@ class SiteConfig:
     enable_waf_slider_solver: bool
     max_waf_slider_attempts: int
     waf_slider_candidate_count: int
+    playwright_driver_pool_size: int
+    session_rebuild_retries: int
+    session_failure_threshold: int
+    session_cooldown_seconds: int
     proxy_servers: List[Dict[str, str]]
     proxy_session_count: int
     skip_failed_proxies: bool
@@ -191,9 +208,15 @@ class SiteConfig:
 class CrawlerSession:
     index: int
     proxy_label: str
-    browser: Browser
-    context: BrowserContext
+    proxy_entry: Optional[Dict[str, str]]
+    browser: Optional[Browser]
+    context: Optional[BrowserContext]
     api_context: Any
     api_mode: str = "request"
     active_pages: int = 0
     max_pages: int = 0
+    consecutive_failures: int = 0
+    rebuild_count: int = 0
+    unhealthy_until: float = 0.0
+    last_error: str = ""
+    rebuild_lock: Any = field(default_factory=asyncio.Lock)

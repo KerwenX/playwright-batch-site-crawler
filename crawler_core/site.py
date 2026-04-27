@@ -110,6 +110,177 @@ class SiteCrawler:
             len(self.frontier),
         )
 
+    async def ensure_playwright_for_recovery(self, reason: str) -> Playwright:
+        if self.playwright is not None:
+            return self.playwright
+        self.playwright = await async_playwright().start()
+        self.owns_playwright = True
+        self.shared_playwright = None
+        self.logger.warning(
+            "Started dedicated Playwright instance for recovery site=%s reason=%s",
+            self.config.site_key,
+            reason,
+        )
+        return self.playwright
+
+    async def launch_session_resources(
+        self,
+        proxy_entry: Optional[Dict[str, str]],
+        *,
+        reason: str,
+        allow_fallback_driver: bool = True,
+    ) -> Tuple[Browser, BrowserContext, Any, str]:
+        playwright = await self.ensure_playwright_for_recovery(reason)
+        proxy_settings = build_playwright_proxy_settings(proxy_entry)
+        try:
+            launch_kwargs = self.build_launch_kwargs(proxy_settings)
+            browser = await playwright.chromium.launch(**launch_kwargs)
+            context = await browser.new_context(ignore_https_errors=True, accept_downloads=True)
+            context.set_default_timeout(self.config.timeout_ms)
+            await context.add_init_script(FORCE_OPEN_SHADOW_ROOTS_SCRIPT)
+            api_context, api_mode = await self.build_api_context(proxy_settings)
+            return browser, context, api_context, api_mode
+        except Exception:
+            if allow_fallback_driver and self.shared_playwright is not None and not self.owns_playwright:
+                self.logger.warning(
+                    "Shared Playwright driver launch failed; switching site=%s to dedicated driver reason=%s",
+                    self.config.site_key,
+                    reason,
+                    exc_info=True,
+                )
+                self.playwright = None
+                playwright = await self.ensure_playwright_for_recovery("fallback:{0}".format(reason))
+                launch_kwargs = self.build_launch_kwargs(proxy_settings)
+                browser = await playwright.chromium.launch(**launch_kwargs)
+                context = await browser.new_context(ignore_https_errors=True, accept_downloads=True)
+                context.set_default_timeout(self.config.timeout_ms)
+                await context.add_init_script(FORCE_OPEN_SHADOW_ROOTS_SCRIPT)
+                api_context, api_mode = await self.build_api_context(proxy_settings)
+                return browser, context, api_context, api_mode
+            raise
+
+    async def dispose_session_resources(self, session: CrawlerSession) -> None:
+        if session.api_context is not None:
+            try:
+                await session.api_context.dispose()
+            except Exception:
+                pass
+        if session.context is not None:
+            try:
+                await session.context.close()
+            except Exception:
+                pass
+        if session.browser is not None:
+            try:
+                await session.browser.close()
+            except Exception:
+                pass
+        session.api_context = None
+        session.context = None
+        session.browser = None
+
+    def is_session_transport_error(self, exc: Exception) -> bool:
+        text = "{0}: {1}".format(type(exc).__name__, exc).lower()
+        markers = (
+            "connection closed while reading from the driver",
+            "target page, context or browser has been closed",
+            "browser has been closed",
+            "connection closed",
+            "target closed",
+            "protocol error",
+            "session closed",
+            "closed while reading",
+        )
+        return any(marker in text for marker in markers)
+
+    def session_on_cooldown(self, session: CrawlerSession) -> bool:
+        return session.unhealthy_until > time.time()
+
+    def session_is_dispatchable(self, session: CrawlerSession) -> bool:
+        return (
+            session.context is not None
+            and session.browser is not None
+            and session.active_pages < session.max_pages
+            and not self.session_on_cooldown(session)
+        )
+
+    def next_session_available_delay(self) -> float:
+        now = time.time()
+        future_times = [
+            max(0.0, session.unhealthy_until - now)
+            for session in self.sessions
+            if session.unhealthy_until > now
+        ]
+        if not future_times:
+            return 0.0
+        return min(future_times)
+
+    async def mark_session_failure(self, session: CrawlerSession, exc: Exception, stage: str) -> bool:
+        session.last_error = "{0}: {1}".format(type(exc).__name__, exc)
+        session.consecutive_failures += 1
+        self.logger.warning(
+            "Session failure site=%s session=%s proxy=%s stage=%s consecutive_failures=%s error=%s",
+            self.config.site_key,
+            session.index,
+            session.proxy_label,
+            stage,
+            session.consecutive_failures,
+            session.last_error,
+        )
+        if session.consecutive_failures < self.config.session_failure_threshold:
+            return True
+        cooldown = max(1, self.config.session_cooldown_seconds)
+        session.unhealthy_until = time.time() + cooldown
+        self.logger.warning(
+            "Session entering cooldown site=%s session=%s proxy=%s cooldown_seconds=%s",
+            self.config.site_key,
+            session.index,
+            session.proxy_label,
+            cooldown,
+        )
+        return False
+
+    def mark_session_success(self, session: CrawlerSession) -> None:
+        session.consecutive_failures = 0
+        session.unhealthy_until = 0.0
+        session.last_error = ""
+
+    async def rebuild_session(self, session: CrawlerSession, reason: str) -> bool:
+        async with session.rebuild_lock:
+            if session.active_pages > 1 and session.context is not None and session.browser is not None and not self.session_on_cooldown(session):
+                return True
+            await self.dispose_session_resources(session)
+            try:
+                browser, context, api_context, api_mode = await self.launch_session_resources(
+                    session.proxy_entry,
+                    reason=reason,
+                )
+            except Exception as exc:
+                self.logger.exception(
+                    "Failed to rebuild session site=%s session=%s proxy=%s reason=%s",
+                    self.config.site_key,
+                    session.index,
+                    session.proxy_label,
+                    reason,
+                )
+                await self.mark_session_failure(session, exc, "rebuild")
+                return False
+            session.browser = browser
+            session.context = context
+            session.api_context = api_context
+            session.api_mode = api_mode
+            session.rebuild_count += 1
+            self.mark_session_success(session)
+            self.logger.info(
+                "Session rebuilt site=%s session=%s proxy=%s rebuild_count=%s reason=%s",
+                self.config.site_key,
+                session.index,
+                session.proxy_label,
+                session.rebuild_count,
+                reason,
+            )
+            return True
+
     async def __aenter__(self) -> "SiteCrawler":
         if self.shared_playwright is not None:
             self.playwright = self.shared_playwright
@@ -127,21 +298,16 @@ class SiteCrawler:
         )
         for index, proxy_entry in enumerate(session_proxies, start=1):
             proxy_label = get_proxy_label(proxy_entry)
-            browser = None
-            context = None
-            api_context = None
             try:
-                proxy_settings = build_playwright_proxy_settings(proxy_entry)
-                launch_kwargs = self.build_launch_kwargs(proxy_settings)
-                browser = await self.playwright.chromium.launch(**launch_kwargs)
-                context = await browser.new_context(ignore_https_errors=True, accept_downloads=True)
-                context.set_default_timeout(self.config.timeout_ms)
-                await context.add_init_script(FORCE_OPEN_SHADOW_ROOTS_SCRIPT)
-                api_context, api_mode = await self.build_api_context(proxy_settings)
+                browser, context, api_context, api_mode = await self.launch_session_resources(
+                    proxy_entry,
+                    reason="initial-session:{0}".format(index),
+                )
                 self.sessions.append(
                     CrawlerSession(
                         index=index,
                         proxy_label=proxy_label,
+                        proxy_entry=proxy_entry,
                         browser=browser,
                         context=context,
                         api_context=api_context,
@@ -158,21 +324,6 @@ class SiteCrawler:
                 )
             except Exception:
                 self.logger.exception("Failed to initialize crawler session index=%s proxy=%s", index, proxy_label)
-                if api_context is not None:
-                    try:
-                        await api_context.dispose()
-                    except Exception:
-                        pass
-                if context is not None:
-                    try:
-                        await context.close()
-                    except Exception:
-                        pass
-                if browser is not None:
-                    try:
-                        await browser.close()
-                    except Exception:
-                        pass
                 if not self.config.skip_failed_proxies:
                     raise
         if not self.sessions:
@@ -195,12 +346,7 @@ class SiteCrawler:
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         for session in self.sessions:
-            if session.api_context is not None:
-                await session.api_context.dispose()
-            if session.context is not None:
-                await session.context.close()
-            if session.browser is not None:
-                await session.browser.close()
+            await self.dispose_session_resources(session)
         if self.playwright is not None and self.owns_playwright:
             await self.playwright.stop()
         self.sessions = []
@@ -338,7 +484,7 @@ class SiteCrawler:
             self.sessions[(start_index + offset) % session_count]
             for offset in range(session_count)
         ]
-        available_sessions = [session for session in ordered_sessions if session.active_pages < session.max_pages]
+        available_sessions = [session for session in ordered_sessions if self.session_is_dispatchable(session)]
         if not available_sessions:
             return None
         session = min(available_sessions, key=lambda item: (item.active_pages, item.index))
@@ -1565,11 +1711,26 @@ class SiteCrawler:
         await self.api_expansion_semaphore.acquire()
         try:
             if session.api_mode == "request" and session.api_context is not None:
-                if method == "GET":
-                    response = await session.api_context.get(url)
-                else:
-                    response = await session.api_context.post(url, data=data or {})
-                return await response.json()
+                try:
+                    if method == "GET":
+                        response = await session.api_context.get(url)
+                    else:
+                        response = await session.api_context.post(url, data=data or {})
+                    payload = await response.json()
+                    self.mark_session_success(session)
+                    return payload
+                except Exception as exc:
+                    if self.is_session_transport_error(exc):
+                        recovered = await self.rebuild_session(session, "api-request:{0}".format(url))
+                        if recovered and session.api_mode == "request" and session.api_context is not None:
+                            if method == "GET":
+                                response = await session.api_context.get(url)
+                            else:
+                                response = await session.api_context.post(url, data=data or {})
+                            payload = await response.json()
+                            self.mark_session_success(session)
+                            return payload
+                    raise
             return await self.fetch_json_via_browser(page, url, method=method, data=data)
         finally:
             self.api_expansion_semaphore.release()
@@ -1623,6 +1784,15 @@ class SiteCrawler:
                 discoveries.extend(await self.collect_response_task_results(response_tasks, handled_tasks))
                 break
         return discoveries
+
+    async def cleanup_response_tasks(self, response_tasks: List[Tuple[str, asyncio.Task[List[Tuple[str, str]]]]]) -> None:
+        if not response_tasks:
+            return
+        tasks = [task for _, task in response_tasks]
+        pending = [task for task in tasks if not task.done()]
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def extract_dom_urls(self, page: Page) -> list[str]:
         payload = await page.evaluate(
@@ -2595,12 +2765,6 @@ class SiteCrawler:
         return []
 
     async def process_page(self, item: QueueItem, session: CrawlerSession, workload_class: str) -> None:
-        page = await session.context.new_page()
-        if self.config.enable_request_blocking:
-            await page.route("**/*", self.handle_route)
-        response_tasks: list[tuple[str, asyncio.Task[list[tuple[str, str]]]]] = []
-        discoveries: list[tuple[str, str]] = []
-        response_state = {"last_seen": time.monotonic()}
         visit = PageVisit(
             requested_url=item.url,
             final_url=item.url,
@@ -2611,140 +2775,190 @@ class SiteCrawler:
             ok=False,
             started_at=time.time(),
         )
-        self.logger.info(
-            "Visit start depth=%s kind=%s workload=%s proxy=%s session=%s active_session_pages=%s from=%s method=%s url=%s",
-            item.depth,
-            visit.page_kind,
-            workload_class,
-            visit.proxy,
-            session.index,
-            session.active_pages,
-            item.discovered_from,
-            item.discovery_method,
-            item.url,
-        )
-
-        def on_response(response: Response) -> None:
-            interesting = (
-                response.request.resource_type in {"document", "xhr", "fetch"}
-                or "application/json" in response.headers.get("content-type", "").lower()
-                or any(response.url.lower().endswith(suffix) for suffix in NON_HTML_SUFFIXES)
-                or (response.request.resource_type == "script" and self.should_parse_script_response_url(response.url))
-            )
-            if not interesting:
-                return
-            response_state["last_seen"] = time.monotonic()
-            discoveries.append((response.url, f"response:{response.request.resource_type}"))
-            response_tasks.append(
-                (
-                    response.url,
-                    asyncio.create_task(
-                        self.parse_response(
-                            response=response,
-                            source_url=item.url,
-                            depth=item.depth + 1,
-                            page_kind=self.page_kind(item.url),
-                            session=session,
-                            page=page,
-                        )
-                    ),
-                )
+        page_attempt_limit = max(1, 1 + self.config.transient_page_retry_limit)
+        for page_attempt in range(1, page_attempt_limit + 1):
+            page: Optional[Page] = None
+            response_tasks: list[tuple[str, asyncio.Task[list[tuple[str, str]]]]] = []
+            discoveries: list[tuple[str, str]] = []
+            response_state = {"last_seen": time.monotonic()}
+            self.logger.info(
+                "Visit start depth=%s kind=%s workload=%s proxy=%s session=%s attempt=%s/%s active_session_pages=%s from=%s method=%s url=%s",
+                item.depth,
+                visit.page_kind,
+                workload_class,
+                visit.proxy,
+                session.index,
+                page_attempt,
+                page_attempt_limit,
+                session.active_pages,
+                item.discovered_from,
+                item.discovery_method,
+                item.url,
             )
 
-        page.on("response", on_response)
-        try:
-            await page.goto(item.url, wait_until="domcontentloaded")
-            await self.settle_page(page, workload_class, visit.page_kind)
-            if await self.is_waf_slider_challenge_page(page):
-                solved = await self.solve_waf_slider_challenge(page, item.url, workload_class)
-                if not solved:
-                    raise RuntimeError("Unable to solve WAF slider challenge for {0}".format(item.url))
-
-            visit.final_url = page.url
-            visit.page_kind = self.page_kind(page.url)
             try:
-                visit.title = await page.title()
-            except Exception as exc:
-                visit.final_url = page.url
-                visit.page_kind = self.page_kind(page.url)
-                visit.title = ""
-                self.logger.debug(
-                    "Failed to read page title depth=%s requested=%s final=%s error=%s",
-                    item.depth,
-                    item.url,
-                    visit.final_url,
-                    exc,
-                )
-            self.remember_ajcass_route(page.url)
+                if session.context is None:
+                    recovered = await self.rebuild_session(session, "missing-context:{0}".format(item.url))
+                    if not recovered:
+                        raise RuntimeError("Session context unavailable for {0}".format(item.url))
+                page = await session.context.new_page()
+                if self.config.enable_request_blocking:
+                    await page.route("**/*", self.handle_route)
 
-            for dom_url in await self.extract_dom_urls(page):
-                discoveries.append((dom_url, "dom"))
-
-            if self.is_ajcass:
-                click_targets: list[str] = []
-                if visit.page_kind == "root":
-                    click_targets = [
-                        "English",
-                        "\u4f5c\u8005\u6295\u7a3f",
-                        "\u4f5c\u8005\u67e5\u7a3f",
-                        "\u4e13\u5bb6\u5ba1\u7a3f",
-                        "\u7f16\u8f91\u529e\u516c",
-                    ]
-                elif visit.page_kind == "english_index":
-                    click_targets = ["JSTOR", "About Us", "Contact Us", "Submission & Review"]
-
-                if click_targets:
-                    discoveries.extend(await self.probe_click_texts(page, page.url, item.depth + 1, click_targets))
-                if visit.page_kind == "english_index":
-                    discoveries.extend(
-                        await self.probe_selector_clicks(
-                            page=page,
-                            source_url=page.url,
-                            selector=".enTitle",
-                            method_prefix="click:.enTitle",
-                            limit=12,
+                def on_response(response: Response) -> None:
+                    interesting = (
+                        response.request.resource_type in {"document", "xhr", "fetch"}
+                        or "application/json" in response.headers.get("content-type", "").lower()
+                        or any(response.url.lower().endswith(suffix) for suffix in NON_HTML_SUFFIXES)
+                        or (response.request.resource_type == "script" and self.should_parse_script_response_url(response.url))
+                    )
+                    if not interesting:
+                        return
+                    response_state["last_seen"] = time.monotonic()
+                    discoveries.append((response.url, f"response:{response.request.resource_type}"))
+                    response_tasks.append(
+                        (
+                            response.url,
+                            asyncio.create_task(
+                                self.parse_response(
+                                    response=response,
+                                    source_url=item.url,
+                                    depth=item.depth + 1,
+                                    page_kind=self.page_kind(item.url),
+                                    session=session,
+                                    page=page,
+                                )
+                            ),
                         )
                     )
-            elif self.is_cbpt_portal_url(page.url):
-                discoveries.extend(await self.discover_cbpt_portal_ajax_urls(page, page.url, visit.page_kind))
-            discoveries.extend(await self.run_generic_interactions(page, page.url, visit.page_kind))
 
-            if response_tasks:
-                discoveries.extend(await self.drain_response_tasks(response_tasks, response_state))
+                page.on("response", on_response)
 
-            for raw_url, method in self.prioritize_discoveries(discoveries):
-                self.enqueue_url(raw_url, item.depth + 1, page.url, method)
+                await page.goto(item.url, wait_until="domcontentloaded")
+                await self.settle_page(page, workload_class, visit.page_kind)
+                if await self.is_waf_slider_challenge_page(page):
+                    solved = await self.solve_waf_slider_challenge(page, item.url, workload_class)
+                    if not solved:
+                        raise RuntimeError("Unable to solve WAF slider challenge for {0}".format(item.url))
 
-            visit.ok = True
-            visit.discoveries = len(discoveries)
-        except Exception:
-            visit.error = traceback.format_exc()
-            self.logger.exception(
-                "Visit failed depth=%s url=%s error=%s",
-                item.depth,
-                item.url,
-                truncate_text(visit.error, 500),
-            )
-        finally:
-            visit.finished_at = time.time()
-            self.visits.append(visit)
-            self.visited_urls.add(item.url)
-            if visit.ok:
-                self.logger.info(
-                    "Visit ok depth=%s final_kind=%s proxy=%s discoveries=%s duration_ms=%s requested=%s final=%s title=%s",
+                visit.final_url = page.url
+                visit.page_kind = self.page_kind(page.url)
+                try:
+                    visit.title = await page.title()
+                except Exception as exc:
+                    visit.final_url = page.url
+                    visit.page_kind = self.page_kind(page.url)
+                    visit.title = ""
+                    self.logger.debug(
+                        "Failed to read page title depth=%s requested=%s final=%s error=%s",
+                        item.depth,
+                        item.url,
+                        visit.final_url,
+                        exc,
+                    )
+                self.remember_ajcass_route(page.url)
+
+                for dom_url in await self.extract_dom_urls(page):
+                    discoveries.append((dom_url, "dom"))
+
+                if self.is_ajcass:
+                    click_targets: list[str] = []
+                    if visit.page_kind == "root":
+                        click_targets = [
+                            "English",
+                            "\u4f5c\u8005\u6295\u7a3f",
+                            "\u4f5c\u8005\u67e5\u7a3f",
+                            "\u4e13\u5bb6\u5ba1\u7a3f",
+                            "\u7f16\u8f91\u529e\u516c",
+                        ]
+                    elif visit.page_kind == "english_index":
+                        click_targets = ["JSTOR", "About Us", "Contact Us", "Submission & Review"]
+
+                    if click_targets:
+                        discoveries.extend(await self.probe_click_texts(page, page.url, item.depth + 1, click_targets))
+                    if visit.page_kind == "english_index":
+                        discoveries.extend(
+                            await self.probe_selector_clicks(
+                                page=page,
+                                source_url=page.url,
+                                selector=".enTitle",
+                                method_prefix="click:.enTitle",
+                                limit=12,
+                            )
+                        )
+                elif self.is_cbpt_portal_url(page.url):
+                    discoveries.extend(await self.discover_cbpt_portal_ajax_urls(page, page.url, visit.page_kind))
+                discoveries.extend(await self.run_generic_interactions(page, page.url, visit.page_kind))
+
+                if response_tasks:
+                    discoveries.extend(await self.drain_response_tasks(response_tasks, response_state))
+
+                for raw_url, method in self.prioritize_discoveries(discoveries):
+                    self.enqueue_url(raw_url, item.depth + 1, page.url, method)
+
+                visit.ok = True
+                visit.discoveries = len(discoveries)
+                self.mark_session_success(session)
+                break
+            except Exception as exc:
+                transport_error = self.is_session_transport_error(exc)
+                if transport_error and page_attempt < page_attempt_limit:
+                    self.logger.warning(
+                        "Transient transport error site=%s session=%s proxy=%s attempt=%s/%s url=%s error=%s",
+                        self.config.site_key,
+                        session.index,
+                        session.proxy_label,
+                        page_attempt,
+                        page_attempt_limit,
+                        item.url,
+                        exc,
+                    )
+                    recovered = False
+                    rebuild_attempts = max(1, self.config.session_rebuild_retries)
+                    for rebuild_attempt in range(1, rebuild_attempts + 1):
+                        recovered = await self.rebuild_session(
+                            session,
+                            "transport:{0}:attempt:{1}:rebuild:{2}".format(item.url, page_attempt, rebuild_attempt),
+                        )
+                        if recovered:
+                            break
+                        await asyncio.sleep(max(0.25, min(2.0, self.next_session_available_delay() or 0.5)))
+                    if recovered:
+                        continue
+
+                visit.error = traceback.format_exc()
+                self.logger.exception(
+                    "Visit failed depth=%s attempt=%s/%s url=%s error=%s",
                     item.depth,
-                    visit.page_kind,
-                    visit.proxy,
-                    visit.discoveries,
-                    visit.duration_ms,
+                    page_attempt,
+                    page_attempt_limit,
                     item.url,
-                    visit.final_url,
-                    truncate_text(visit.title),
+                    truncate_text(visit.error, 500),
                 )
-            try:
-                await page.close()
-            except Exception:
-                self.logger.debug("Failed to close page requested=%s final=%s", item.url, visit.final_url, exc_info=True)
+                break
+            finally:
+                await self.cleanup_response_tasks(response_tasks)
+                if page is not None:
+                    try:
+                        await page.close()
+                    except Exception:
+                        self.logger.debug("Failed to close page requested=%s final=%s", item.url, visit.final_url, exc_info=True)
+
+        visit.finished_at = time.time()
+        self.visits.append(visit)
+        self.visited_urls.add(item.url)
+        if visit.ok:
+            self.logger.info(
+                "Visit ok depth=%s final_kind=%s proxy=%s discoveries=%s duration_ms=%s requested=%s final=%s title=%s",
+                item.depth,
+                visit.page_kind,
+                visit.proxy,
+                visit.discoveries,
+                visit.duration_ms,
+                item.url,
+                visit.final_url,
+                truncate_text(visit.title),
+            )
 
     async def crawl(self) -> dict[str, Any]:
         processed_pages = 0
@@ -2801,6 +3015,18 @@ class SiteCrawler:
                 )
 
             if not active_tasks:
+                if self.frontier:
+                    delay = self.next_session_available_delay()
+                    if delay > 0:
+                        sleep_for = max(0.25, min(2.0, delay))
+                        self.logger.warning(
+                            "All sessions temporarily unavailable site=%s frontier=%s sleeping_seconds=%.2f",
+                            self.config.site_key,
+                            len(self.frontier),
+                            sleep_for,
+                        )
+                        await asyncio.sleep(sleep_for)
+                        continue
                 break
 
             visits_before = len(self.visits)
@@ -2906,12 +3132,20 @@ class SiteCrawler:
                 "heavy_page_settle_ms": self.config.heavy_page_settle_ms,
                 "light_page_settle_ms": self.config.light_page_settle_ms,
                 "response_grace_ms": self.config.response_grace_ms,
+                "transient_page_retry_limit": self.config.transient_page_retry_limit,
                 "write_full_outputs_on_checkpoint": self.config.write_full_outputs_on_checkpoint,
                 "enable_cbpt_portal_ajax_expansion": self.config.enable_cbpt_portal_ajax_expansion,
                 "max_cbpt_portal_ajax_requests_per_page": self.config.max_cbpt_portal_ajax_requests_per_page,
                 "enable_waf_slider_solver": self.config.enable_waf_slider_solver,
                 "max_waf_slider_attempts": self.config.max_waf_slider_attempts,
                 "waf_slider_candidate_count": self.config.waf_slider_candidate_count,
+                "playwright_driver_pool_size": self.config.playwright_driver_pool_size,
+                "session_rebuild_retries": self.config.session_rebuild_retries,
+                "session_failure_threshold": self.config.session_failure_threshold,
+                "session_cooldown_seconds": self.config.session_cooldown_seconds,
+                "session_rebuild_counts": {
+                    str(session.index): session.rebuild_count for session in self.sessions
+                },
             },
             "verification": {
                 "expected_issue_search_urls": len(self.expected_issue_search_urls),
