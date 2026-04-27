@@ -17,6 +17,34 @@
 - 服务器入口：[server_batch_crawler.py](/D:/Desktop/qoder%20work/server_batch_crawler.py)
 - 核心逻辑：[site_batch_crawler.py](/D:/Desktop/qoder%20work/site_batch_crawler.py)
 
+## 项目结构
+
+当前已经将原来的单文件核心逻辑拆分为包内模块，外部启动方式保持不变：
+
+- `ajcass_crawler.py`
+  - 本地运行入口。
+- `server_batch_crawler.py`
+  - Docker / Python 3.8 服务器入口。
+- `site_batch_crawler.py`
+  - 兼容层，保留旧的导入路径与启动方式，内部转发到 `crawler_core`。
+- `crawler_core/constants.py`
+  - 常量、默认配置、站点规则常量。
+- `crawler_core/models.py`
+  - `BatchConfig`、`SiteConfig`、队列项、访问记录等数据模型。
+- `crawler_core/utils.py`
+  - URL 规范化、文件写入、日志、代理配置、分组等通用工具函数。
+- `crawler_core/site.py`
+  - 单站点抓取核心逻辑，包含发现、交互、断点续传、输出落盘。
+- `crawler_core/batch.py`
+  - 批量站点调度与多站并发入口。
+- `crawler_core/cli.py`
+  - CLI 级 `main/async_main` 封装。
+
+这样拆分后：
+- 本地版和服务器版仍然共用同一套核心代码。
+- 后续新增站点规则或调度能力时，不需要继续在一个超大文件里改动。
+- 旧脚本、旧命令、旧导入路径不需要改。
+
 ## 设计目标
 
 默认策略不是“识别正文页后停止”，而是：
