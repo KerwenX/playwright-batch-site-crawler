@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import html as html_lib
 import json
+import math
 import re
 import time
 import traceback
@@ -49,6 +50,8 @@ class SiteCrawler:
         self.api_context = None
         self.sessions: List[CrawlerSession] = []
         self.session_index = 0
+        self.active_page_counts: Dict[str, int] = {"heavy": 0, "light": 0}
+        self.api_expansion_semaphore = asyncio.Semaphore(self.effective_api_expansion_limit())
 
         self.frontier: Deque[QueueItem] = deque()
         self.active_queue_items: Dict[str, QueueItem] = {}
@@ -133,7 +136,7 @@ class SiteCrawler:
                 context = await browser.new_context(ignore_https_errors=True, accept_downloads=True)
                 context.set_default_timeout(self.config.timeout_ms)
                 await context.add_init_script(FORCE_OPEN_SHADOW_ROOTS_SCRIPT)
-                api_context = await self.build_api_context(proxy_settings)
+                api_context, api_mode = await self.build_api_context(proxy_settings)
                 self.sessions.append(
                     CrawlerSession(
                         index=index,
@@ -141,12 +144,14 @@ class SiteCrawler:
                         browser=browser,
                         context=context,
                         api_context=api_context,
+                        api_mode=api_mode,
                     )
                 )
                 self.logger.info(
-                    "Crawler session ready index=%s proxy=%s timeout_ms=%s settle_ms=%s",
+                    "Crawler session ready index=%s proxy=%s api_mode=%s timeout_ms=%s settle_ms=%s",
                     index,
                     proxy_label,
+                    api_mode,
                     self.config.timeout_ms,
                     self.config.settle_ms,
                 )
@@ -171,9 +176,20 @@ class SiteCrawler:
                     raise
         if not self.sessions:
             raise RuntimeError("No crawler sessions were initialized.")
+        session_page_limit = self.effective_session_page_limit(len(self.sessions))
+        for session in self.sessions:
+            session.max_pages = session_page_limit
         self.browser = self.sessions[0].browser
         self.context = self.sessions[0].context
         self.api_context = self.sessions[0].api_context
+        self.logger.info(
+            "Crawler pool ready sessions=%s session_page_limit=%s heavy_limit=%s light_limit=%s api_limit=%s",
+            len(self.sessions),
+            session_page_limit,
+            self.effective_heavy_page_limit(),
+            self.effective_light_page_limit(),
+            self.effective_api_expansion_limit(),
+        )
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -191,7 +207,8 @@ class SiteCrawler:
 
     def build_session_proxies(self) -> List[Optional[Dict[str, str]]]:
         if not self.config.proxy_servers:
-            return [None]
+            session_count = max(1, self.config.proxy_session_count or 1)
+            return [None for _ in range(session_count)]
         session_count = self.config.proxy_session_count or min(self.config.max_concurrency, len(self.config.proxy_servers))
         session_count = max(1, session_count)
         proxies = []
@@ -216,19 +233,20 @@ class SiteCrawler:
             launch_kwargs["proxy"] = proxy_settings
         return launch_kwargs
 
-    async def build_api_context(self, proxy_settings: Optional[Dict[str, str]]) -> Any:
+    async def build_api_context(self, proxy_settings: Optional[Dict[str, str]]) -> Tuple[Any, str]:
         api_kwargs = {"ignore_https_errors": True}
         if proxy_settings:
             api_kwargs["proxy"] = proxy_settings
         try:
-            return await self.playwright.request.new_context(**api_kwargs)
+            return await self.playwright.request.new_context(**api_kwargs), "request"
         except TypeError:
             if proxy_settings:
                 self.logger.warning(
-                    "Playwright request context does not accept proxy in this build; falling back to direct API context proxy=%s",
+                    "Playwright request context does not accept proxy in this build; falling back to browser-backed API fetch proxy=%s",
                     proxy_settings.get("server"),
                 )
-            return await self.playwright.request.new_context(ignore_https_errors=True)
+                return None, "browser"
+            return await self.playwright.request.new_context(ignore_https_errors=True), "request"
 
     def get_next_session(self) -> CrawlerSession:
         if not self.sessions:
@@ -236,6 +254,106 @@ class SiteCrawler:
         session = self.sessions[self.session_index % len(self.sessions)]
         self.session_index += 1
         return session
+
+    def effective_heavy_page_limit(self) -> int:
+        configured = self.config.max_heavy_page_concurrency
+        if configured > 0:
+            return min(configured, self.config.max_concurrency)
+        return max(1, min(self.config.max_concurrency, max(4, math.ceil(self.config.max_concurrency / 3))))
+
+    def effective_light_page_limit(self) -> int:
+        configured = self.config.max_light_page_concurrency
+        if configured > 0:
+            return min(configured, self.config.max_concurrency)
+        return self.config.max_concurrency
+
+    def effective_api_expansion_limit(self) -> int:
+        configured = self.config.max_api_expansion_concurrency
+        if configured > 0:
+            return configured
+        return max(1, min(64, max(8, math.ceil(self.config.max_concurrency / 2))))
+
+    def effective_session_page_limit(self, session_count: int) -> int:
+        if self.config.max_pages_per_session > 0:
+            return self.config.max_pages_per_session
+        return max(1, math.ceil(self.config.max_concurrency / max(1, session_count)))
+
+    def page_workload_class(self, url: str) -> str:
+        kind = self.page_kind(url)
+        lowered_url = (self.normalize_url(url) or url).lower()
+        path = urlsplit(lowered_url).path
+        if kind in {
+            "detail",
+            "issue_detail",
+            "english_issue",
+            "cbpt_article",
+            "cbpt_portal_article",
+            "cbpt_portal_news",
+            "cbpt_aux",
+            "cbpt_portal_aux",
+        }:
+            return "light"
+        if kind == "page":
+            if any(token in path for token in ("/view", "/show", "/detail", "/content", "/article", "/paper", "/newsview", "/abstract")):
+                return "light"
+            if re.search(r"/[a-z]+/reader/(view|detail)", path):
+                return "light"
+            if any(token in lowered_url for token in ("articledetail", "paperid=", "contentid=", "articleid=", "newsid=", "detailid=")):
+                return "light"
+        if kind in {
+            "root",
+            "issue_search",
+            "english_index",
+            "cbpt_list",
+            "cbpt_portal_index",
+            "cbpt_portal_list",
+            "page",
+        }:
+            return "heavy"
+        return "light"
+
+    def can_dispatch_workload(self, workload_class: str) -> bool:
+        if workload_class == "heavy":
+            return self.active_page_counts["heavy"] < self.effective_heavy_page_limit()
+        return self.active_page_counts["light"] < self.effective_light_page_limit()
+
+    def reserve_workload_slot(self, workload_class: str) -> None:
+        self.active_page_counts[workload_class] = self.active_page_counts.get(workload_class, 0) + 1
+
+    def release_workload_slot(self, workload_class: str) -> None:
+        self.active_page_counts[workload_class] = max(0, self.active_page_counts.get(workload_class, 0) - 1)
+
+    def reserve_dispatch_session(self) -> Optional[CrawlerSession]:
+        if not self.sessions:
+            return None
+        session_count = len(self.sessions)
+        start_index = self.session_index % session_count
+        ordered_sessions = [
+            self.sessions[(start_index + offset) % session_count]
+            for offset in range(session_count)
+        ]
+        available_sessions = [session for session in ordered_sessions if session.active_pages < session.max_pages]
+        if not available_sessions:
+            return None
+        session = min(available_sessions, key=lambda item: (item.active_pages, item.index))
+        session.active_pages += 1
+        self.session_index = session.index % session_count
+        return session
+
+    def release_dispatch_session(self, session: CrawlerSession) -> None:
+        session.active_pages = max(0, session.active_pages - 1)
+
+    def pop_next_dispatchable_item(self) -> Optional[Tuple[QueueItem, str]]:
+        if not self.frontier:
+            return None
+        for index, item in enumerate(self.frontier):
+            workload_class = self.page_workload_class(item.url)
+            if self.can_dispatch_workload(workload_class):
+                self.frontier.rotate(-index)
+                selected_item = self.frontier.popleft()
+                self.frontier.rotate(index)
+                return selected_item, workload_class
+        return None
 
     def frontier_count(self) -> int:
         return len(self.frontier) + len(self.active_queue_items)
@@ -1163,12 +1281,116 @@ class SiteCrawler:
             )
         return normalized
 
-    async def settle_page(self, page: Page) -> None:
+    async def settle_page(self, page: Page, workload_class: str, page_kind: str) -> None:
+        needs_network_idle = workload_class == "heavy" or self.site_family in {"ajcass", "cbpt_cnki"}
+        settle_ms = self.config.heavy_page_settle_ms if workload_class == "heavy" else self.config.light_page_settle_ms
+        if needs_network_idle:
+            try:
+                await page.wait_for_load_state("networkidle", timeout=self.config.timeout_ms)
+            except PlaywrightTimeoutError:
+                pass
+        else:
+            try:
+                await page.wait_for_load_state("load", timeout=min(self.config.timeout_ms, 5000))
+            except PlaywrightTimeoutError:
+                pass
+        if settle_ms > 0:
+            await page.wait_for_timeout(settle_ms)
+
+    async def fetch_json_via_browser(self, page: Page, url: str, method: str = "GET", data: Optional[Dict[str, Any]] = None) -> Any:
+        payload = await page.evaluate(
+            """async ({ url, method, data }) => {
+                const options = { method, credentials: 'include' };
+                if (method !== 'GET' && data) {
+                    const params = new URLSearchParams();
+                    for (const [key, value] of Object.entries(data)) {
+                        if (value === null || value === undefined) continue;
+                        if (Array.isArray(value)) {
+                            for (const item of value) {
+                                if (item === null || item === undefined) continue;
+                                params.append(key, String(item));
+                            }
+                        } else {
+                            params.append(key, String(value));
+                        }
+                    }
+                    options.body = params.toString();
+                    options.headers = { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' };
+                }
+                const response = await fetch(url, options);
+                const text = await response.text();
+                return { ok: response.ok, status: response.status, text };
+            }""",
+            {"url": url, "method": method, "data": data or {}},
+        )
+        text = str(payload.get("text") or "")
         try:
-            await page.wait_for_load_state("networkidle", timeout=self.config.timeout_ms)
-        except PlaywrightTimeoutError:
-            pass
-        await page.wait_for_timeout(self.config.settle_ms)
+            return json.loads(text)
+        except Exception as exc:
+            raise ValueError("Browser fetch returned non-JSON response status={0} url={1}".format(payload.get("status"), url)) from exc
+
+    async def request_json(self, session: CrawlerSession, page: Page, method: str, url: str, data: Optional[Dict[str, Any]] = None) -> Any:
+        await self.api_expansion_semaphore.acquire()
+        try:
+            if session.api_mode == "request" and session.api_context is not None:
+                if method == "GET":
+                    response = await session.api_context.get(url)
+                else:
+                    response = await session.api_context.post(url, data=data or {})
+                return await response.json()
+            return await self.fetch_json_via_browser(page, url, method=method, data=data)
+        finally:
+            self.api_expansion_semaphore.release()
+
+    async def collect_response_task_results(
+        self,
+        response_tasks: List[Tuple[str, asyncio.Task[List[Tuple[str, str]]]]],
+        handled_tasks: Set[asyncio.Task[List[Tuple[str, str]]]],
+    ) -> List[Tuple[str, str]]:
+        discoveries: List[Tuple[str, str]] = []
+        for response_url, task in response_tasks:
+            if task in handled_tasks or not task.done():
+                continue
+            handled_tasks.add(task)
+            try:
+                result = await task
+                if isinstance(result, list):
+                    discoveries.extend(result)
+            except Exception as exc:
+                self.logger.warning(
+                    "Response parse task failed response_url=%s error=%s",
+                    response_url,
+                    exc,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+        return discoveries
+
+    async def drain_response_tasks(
+        self,
+        response_tasks: List[Tuple[str, asyncio.Task[List[Tuple[str, str]]]]],
+        response_state: Dict[str, float],
+    ) -> List[Tuple[str, str]]:
+        if not response_tasks:
+            return []
+        discoveries: List[Tuple[str, str]] = []
+        handled_tasks: Set[asyncio.Task[List[Tuple[str, str]]]] = set()
+        grace_seconds = max(0.0, self.config.response_grace_ms / 1000.0)
+        sleep_interval = 0.2 if grace_seconds <= 0 else min(0.5, max(0.05, grace_seconds / 4.0))
+        while True:
+            discoveries.extend(await self.collect_response_task_results(response_tasks, handled_tasks))
+            pending_tasks = [task for _, task in response_tasks if task not in handled_tasks]
+            if not pending_tasks:
+                if time.monotonic() - response_state["last_seen"] >= grace_seconds:
+                    break
+                await asyncio.sleep(sleep_interval)
+                continue
+            done, _ = await asyncio.wait(pending_tasks, timeout=sleep_interval, return_when=asyncio.FIRST_COMPLETED)
+            if done:
+                response_state["last_seen"] = time.monotonic()
+            if time.monotonic() - response_state["last_seen"] >= grace_seconds and all(task.done() for task in pending_tasks):
+                discoveries.extend(await self.collect_response_task_results(response_tasks, handled_tasks))
+                break
+        return discoveries
 
     async def extract_dom_urls(self, page: Page) -> list[str]:
         payload = await page.evaluate(
@@ -1548,7 +1770,15 @@ class SiteCrawler:
                     found.append((value, f"{method}:{key}"))
         return found
 
-    async def parse_paginated_site_content(self, source_url: str, depth: int, payload: Dict[str, Any], total_pages: int, api_context: Any) -> List[Tuple[str, str]]:
+    async def parse_paginated_site_content(
+        self,
+        source_url: str,
+        depth: int,
+        payload: Dict[str, Any],
+        total_pages: int,
+        session: CrawlerSession,
+        page: Page,
+    ) -> List[Tuple[str, str]]:
         found: List[Tuple[str, str]] = []
         current = int(payload.get("curr", 1))
         page_numbers = list(range(current + 1, total_pages + 1))
@@ -1561,12 +1791,29 @@ class SiteCrawler:
             if fetch_key in self.fetched_api_pages:
                 continue
             self.fetched_api_pages.add(fetch_key)
-            response = await api_context.post(AJCASS_SITE_CONTENT_API, data=next_payload)
-            data = await response.json()
-            found.extend(await self.parse_site_content_response(data, next_payload, source_url, depth, api_context, allow_pagination=False))
+            data = await self.request_json(session, page, "POST", AJCASS_SITE_CONTENT_API, data=next_payload)
+            found.extend(
+                await self.parse_site_content_response(
+                    data,
+                    next_payload,
+                    source_url,
+                    depth,
+                    session,
+                    page,
+                    allow_pagination=False,
+                )
+            )
         return found
 
-    async def parse_paginated_issue_search(self, source_url: str, depth: int, payload: Dict[str, Any], total_pages: int, api_context: Any) -> List[Tuple[str, str]]:
+    async def parse_paginated_issue_search(
+        self,
+        source_url: str,
+        depth: int,
+        payload: Dict[str, Any],
+        total_pages: int,
+        session: CrawlerSession,
+        page: Page,
+    ) -> List[Tuple[str, str]]:
         found: List[Tuple[str, str]] = []
         current = int(payload.get("curr", 1))
         page_numbers = list(range(current + 1, total_pages + 1))
@@ -1579,12 +1826,29 @@ class SiteCrawler:
             if fetch_key in self.fetched_api_pages:
                 continue
             self.fetched_api_pages.add(fetch_key)
-            response = await api_context.post(AJCASS_ISSUE_SEARCH_API, data=next_payload)
-            data = await response.json()
-            found.extend(await self.parse_issue_search_response(data, next_payload, source_url, depth, api_context, allow_pagination=False))
+            data = await self.request_json(session, page, "POST", AJCASS_ISSUE_SEARCH_API, data=next_payload)
+            found.extend(
+                await self.parse_issue_search_response(
+                    data,
+                    next_payload,
+                    source_url,
+                    depth,
+                    session,
+                    page,
+                    allow_pagination=False,
+                )
+            )
         return found
 
-    async def parse_paginated_issue_simple_search(self, source_url: str, depth: int, payload: Dict[str, Any], total_pages: int, api_context: Any) -> List[Tuple[str, str]]:
+    async def parse_paginated_issue_simple_search(
+        self,
+        source_url: str,
+        depth: int,
+        payload: Dict[str, Any],
+        total_pages: int,
+        session: CrawlerSession,
+        page: Page,
+    ) -> List[Tuple[str, str]]:
         found: List[Tuple[str, str]] = []
         current = int(payload.get("curr", 1))
         page_numbers = list(range(current + 1, total_pages + 1))
@@ -1597,9 +1861,18 @@ class SiteCrawler:
             if fetch_key in self.fetched_api_pages:
                 continue
             self.fetched_api_pages.add(fetch_key)
-            response = await api_context.post(AJCASS_ISSUE_SIMPLE_API, data=next_payload)
-            data = await response.json()
-            found.extend(await self.parse_issue_simple_response(data, next_payload, source_url, depth, api_context, allow_pagination=False))
+            data = await self.request_json(session, page, "POST", AJCASS_ISSUE_SIMPLE_API, data=next_payload)
+            found.extend(
+                await self.parse_issue_simple_response(
+                    data,
+                    next_payload,
+                    source_url,
+                    depth,
+                    session,
+                    page,
+                    allow_pagination=False,
+                )
+            )
         return found
 
     async def parse_site_content_response(
@@ -1608,7 +1881,8 @@ class SiteCrawler:
         payload: Dict[str, Any],
         source_url: str,
         depth: int,
-        api_context: Any,
+        session: CrawlerSession,
+        page: Page,
         allow_pagination: bool = True,
     ) -> List[Tuple[str, str]]:
         found: List[Tuple[str, str]] = []
@@ -1643,7 +1917,7 @@ class SiteCrawler:
 
         total_pages = int(data.get("totalpage") or 1)
         if allow_pagination and total_pages > int(payload.get("curr", 1)):
-            found.extend(await self.parse_paginated_site_content(source_url, depth, payload, total_pages, api_context))
+            found.extend(await self.parse_paginated_site_content(source_url, depth, payload, total_pages, session, page))
         return found
 
     async def parse_issue_search_response(
@@ -1652,13 +1926,14 @@ class SiteCrawler:
         payload: Dict[str, Any],
         source_url: str,
         depth: int,
-        api_context: Any,
+        session: CrawlerSession,
+        page: Page,
         allow_pagination: bool = True,
     ) -> List[Tuple[str, str]]:
         found = self.parse_ajcass_issue_items(data.get("data") or [], "api:GetIssueNormalSearch:issueDetail")
         total_pages = int(data.get("totalpage") or 1)
         if allow_pagination and total_pages > int(payload.get("curr", 1)):
-            found.extend(await self.parse_paginated_issue_search(source_url, depth, payload, total_pages, api_context))
+            found.extend(await self.parse_paginated_issue_search(source_url, depth, payload, total_pages, session, page))
         return found
 
     async def parse_issue_simple_response(
@@ -1667,7 +1942,8 @@ class SiteCrawler:
         payload: Dict[str, Any],
         source_url: str,
         depth: int,
-        api_context: Any,
+        session: CrawlerSession,
+        page: Page,
         allow_pagination: bool = True,
     ) -> List[Tuple[str, str]]:
         found = self.parse_ajcass_issue_items(
@@ -1677,7 +1953,7 @@ class SiteCrawler:
         )
         total_pages = int(data.get("totalpage") or 1)
         if allow_pagination and total_pages > int(payload.get("curr", 1)):
-            found.extend(await self.parse_paginated_issue_simple_search(source_url, depth, payload, total_pages, api_context))
+            found.extend(await self.parse_paginated_issue_simple_search(source_url, depth, payload, total_pages, session, page))
         return found
 
     def parse_current_issue_tree(self, data: Dict[str, Any]) -> List[Tuple[str, str]]:
@@ -1802,7 +2078,8 @@ class SiteCrawler:
         self,
         data: Dict[str, Any],
         journal_id: Any,
-        api_context: Any,
+        session: CrawlerSession,
+        page: Page,
         gap_year: Any,
     ) -> List[Tuple[str, str]]:
         found: List[Tuple[str, str]] = []
@@ -1819,19 +2096,19 @@ class SiteCrawler:
                 continue
             self.fetched_api_pages.add(fetch_key)
             try:
-                response = await api_context.get(fetch_url)
-                payload = await response.json()
+                payload = await self.request_json(session, page, "GET", fetch_url)
             except Exception as exc:
                 self.logger.warning("Failed to expand Boyuan year issues journal_id=%s year=%s error=%s", journal_id, year, exc)
                 continue
-            found.extend(await self.parse_boyuan_issue_list_response(payload, year=year, api_context=api_context))
+            found.extend(await self.parse_boyuan_issue_list_response(payload, year=year))
         return found
 
     async def parse_boyuan_gap_year_response(
         self,
         data: Dict[str, Any],
         request_params: Dict[str, Any],
-        api_context: Any,
+        session: CrawlerSession,
+        page: Page,
     ) -> List[Tuple[str, str]]:
         journal_id = request_params.get("journalId")
         if journal_id in (None, ""):
@@ -1850,12 +2127,11 @@ class SiteCrawler:
                 continue
             self.fetched_api_pages.add(fetch_key)
             try:
-                response = await api_context.get(fetch_url)
-                payload = await response.json()
+                payload = await self.request_json(session, page, "GET", fetch_url)
             except Exception as exc:
                 self.logger.warning("Failed to expand Boyuan gap year journal_id=%s group_year=%s error=%s", journal_id, group_year, exc)
                 continue
-            found.extend(await self.parse_boyuan_journal_year_response(payload, journal_id=journal_id, api_context=api_context, gap_year=gap_size))
+            found.extend(await self.parse_boyuan_journal_year_response(payload, journal_id=journal_id, session=session, page=page, gap_year=gap_size))
         return found
 
     async def parse_boyuan_issue_list_response(
@@ -1863,7 +2139,6 @@ class SiteCrawler:
         data: Dict[str, Any],
         *,
         year: Any,
-        api_context: Any,
     ) -> List[Tuple[str, str]]:
         found: List[Tuple[str, str]] = []
         issues = data.get("data") or []
@@ -1882,7 +2157,8 @@ class SiteCrawler:
         source_url: str,
         payload: Dict[str, Any],
         total_pages: int,
-        api_context: Any,
+        session: CrawlerSession,
+        page: Page,
     ) -> List[Tuple[str, str]]:
         found: List[Tuple[str, str]] = []
         current = int(payload.get("curr", 1))
@@ -1897,8 +2173,7 @@ class SiteCrawler:
                 continue
             self.fetched_api_pages.add(fetch_key)
             try:
-                response = await api_context.post(f"{BOYUAN_SITE_WEB_API_PREFIX}GetBackIssueBrowsing", data=next_payload)
-                data = await response.json()
+                data = await self.request_json(session, page, "POST", f"{BOYUAN_SITE_WEB_API_PREFIX}GetBackIssueBrowsing", data=next_payload)
             except Exception as exc:
                 self.logger.warning("Failed to expand Boyuan back issue source=%s page=%s error=%s", source_url, page_num, exc)
                 continue
@@ -1907,7 +2182,8 @@ class SiteCrawler:
                     data,
                     payload=next_payload,
                     source_url=source_url,
-                    api_context=api_context,
+                    session=session,
+                    page=page,
                     allow_pagination=False,
                 )
             )
@@ -1919,7 +2195,8 @@ class SiteCrawler:
         *,
         payload: Dict[str, Any],
         source_url: str,
-        api_context: Any,
+        session: CrawlerSession,
+        page: Page,
         allow_pagination: bool = True,
     ) -> List[Tuple[str, str]]:
         year = payload.get("year")
@@ -1927,7 +2204,7 @@ class SiteCrawler:
         found = self.parse_boyuan_article_items(data.get("data") or [], "api:GetBackIssueBrowsing:detail", year=year, issue=issue)
         total_pages = int(data.get("totalpage") or 1)
         if allow_pagination and total_pages > int(payload.get("curr", 1)):
-            found.extend(await self.parse_paginated_boyuan_back_issue(source_url, payload, total_pages, api_context))
+            found.extend(await self.parse_paginated_boyuan_back_issue(source_url, payload, total_pages, session, page))
         return found
 
     async def parse_boyuan_json_response(
@@ -1935,22 +2212,24 @@ class SiteCrawler:
         data: Dict[str, Any],
         response: Response,
         source_url: str,
-        api_context: Any,
+        session: CrawlerSession,
+        page: Page,
     ) -> List[Tuple[str, str]]:
         url = response.url
         request = response.request
         params = dict(parse_qsl(urlsplit(url).query, keep_blank_values=True))
         if "GetJournalGapYear" in url:
-            return await self.parse_boyuan_gap_year_response(data, params, api_context)
+            return await self.parse_boyuan_gap_year_response(data, params, session, page)
         if "GetJournalYear" in url:
             return await self.parse_boyuan_journal_year_response(
                 data,
                 journal_id=params.get("journalId"),
-                api_context=api_context,
+                session=session,
+                page=page,
                 gap_year=params.get("gapYear"),
             )
         if "GetThatYearIssueList" in url:
-            return await self.parse_boyuan_issue_list_response(data, year=params.get("year"), api_context=api_context)
+            return await self.parse_boyuan_issue_list_response(data, year=params.get("year"))
         if "GetJournalIssueList" in url:
             return [
                 (self.build_boyuan_browse_url(year=params.get("year"), issue=item.get("issue")), "api:GetJournalIssueList:browse")
@@ -1962,7 +2241,7 @@ class SiteCrawler:
                 payload = request.post_data_json or {}
             except Exception:
                 payload = {}
-            return await self.parse_boyuan_back_issue_response(data, payload=payload, source_url=source_url, api_context=api_context)
+            return await self.parse_boyuan_back_issue_response(data, payload=payload, source_url=source_url, session=session, page=page)
         if "GetJournalArticleList" in url:
             try:
                 payload = request.post_data_json or {}
@@ -1998,7 +2277,15 @@ class SiteCrawler:
             found.extend(self.extract_generic_spa_routes_from_script(text, source_url))
         return found
 
-    async def parse_json_response(self, response: Response, source_url: str, depth: int, page_kind: str, api_context: Any) -> List[Tuple[str, str]]:
+    async def parse_json_response(
+        self,
+        response: Response,
+        source_url: str,
+        depth: int,
+        page_kind: str,
+        session: CrawlerSession,
+        page: Page,
+    ) -> List[Tuple[str, str]]:
         url = response.url
         request = response.request
         api_key = f"{url}|{request.method}|{request.post_data or ''}"
@@ -2035,45 +2322,53 @@ class SiteCrawler:
                     payload = request.post_data_json or {}
                 except Exception:
                     payload = {}
-                found.extend(await self.parse_site_content_response(data, payload, source_url, depth, api_context))
+                found.extend(await self.parse_site_content_response(data, payload, source_url, depth, session, page))
             elif "GetIssueNormalSearch" in url:
                 payload = {}
                 try:
                     payload = request.post_data_json or {}
                 except Exception:
                     payload = {}
-                found.extend(await self.parse_issue_search_response(data, payload, source_url, depth, api_context))
+                found.extend(await self.parse_issue_search_response(data, payload, source_url, depth, session, page))
             elif "GetIssueSimpleSearch" in url:
                 payload = {}
                 try:
                     payload = request.post_data_json or {}
                 except Exception:
                     payload = {}
-                found.extend(await self.parse_issue_simple_response(data, payload, source_url, depth, api_context))
+                found.extend(await self.parse_issue_simple_response(data, payload, source_url, depth, session, page))
             elif "GetIssueinfoList" in url:
                 found.extend(self.parse_ajcass_issue_items(data.get("data") or [], "api:GetIssueinfoList:issueDetail"))
             elif "GetContentInfo" in url:
                 found.extend(self.parse_content_info(data))
         elif self.is_boyuan_api_url(url):
-            found.extend(await self.parse_boyuan_json_response(data, response, source_url, api_context))
+            found.extend(await self.parse_boyuan_json_response(data, response, source_url, session, page))
         found.extend((url_candidate, "response:json") for url_candidate in self.iter_string_urls(data))
         return found
 
-    async def parse_response(self, response: Response, source_url: str, depth: int, page_kind: str, api_context: Any) -> List[Tuple[str, str]]:
+    async def parse_response(
+        self,
+        response: Response,
+        source_url: str,
+        depth: int,
+        page_kind: str,
+        session: CrawlerSession,
+        page: Page,
+    ) -> List[Tuple[str, str]]:
         content_type = response.headers.get("content-type", "").lower()
         if "application/json" in content_type or "+json" in content_type:
-            return await self.parse_json_response(response, source_url, depth, page_kind, api_context)
+            return await self.parse_json_response(response, source_url, depth, page_kind, session, page)
         if "javascript" in content_type or response.url.lower().endswith(".js"):
             return await self.parse_script_response(response, source_url)
         return []
 
-    async def process_page(self, item: QueueItem) -> None:
-        session = self.get_next_session()
+    async def process_page(self, item: QueueItem, session: CrawlerSession, workload_class: str) -> None:
         page = await session.context.new_page()
         if self.config.enable_request_blocking:
             await page.route("**/*", self.handle_route)
         response_tasks: list[tuple[str, asyncio.Task[list[tuple[str, str]]]]] = []
         discoveries: list[tuple[str, str]] = []
+        response_state = {"last_seen": time.monotonic()}
         visit = PageVisit(
             requested_url=item.url,
             final_url=item.url,
@@ -2085,10 +2380,13 @@ class SiteCrawler:
             started_at=time.time(),
         )
         self.logger.info(
-            "Visit start depth=%s kind=%s proxy=%s from=%s method=%s url=%s",
+            "Visit start depth=%s kind=%s workload=%s proxy=%s session=%s active_session_pages=%s from=%s method=%s url=%s",
             item.depth,
             visit.page_kind,
+            workload_class,
             visit.proxy,
+            session.index,
+            session.active_pages,
             item.discovered_from,
             item.discovery_method,
             item.url,
@@ -2103,6 +2401,7 @@ class SiteCrawler:
             )
             if not interesting:
                 return
+            response_state["last_seen"] = time.monotonic()
             discoveries.append((response.url, f"response:{response.request.resource_type}"))
             response_tasks.append(
                 (
@@ -2113,7 +2412,8 @@ class SiteCrawler:
                             source_url=item.url,
                             depth=item.depth + 1,
                             page_kind=self.page_kind(item.url),
-                            api_context=session.api_context,
+                            session=session,
+                            page=page,
                         )
                     ),
                 )
@@ -2122,7 +2422,7 @@ class SiteCrawler:
         page.on("response", on_response)
         try:
             await page.goto(item.url, wait_until="domcontentloaded")
-            await self.settle_page(page)
+            await self.settle_page(page, workload_class, visit.page_kind)
 
             visit.final_url = page.url
             visit.page_kind = self.page_kind(page.url)
@@ -2174,20 +2474,7 @@ class SiteCrawler:
             discoveries.extend(await self.run_generic_interactions(page, page.url, visit.page_kind))
 
             if response_tasks:
-                response_results = await asyncio.gather(
-                    *(task for _, task in response_tasks),
-                    return_exceptions=True,
-                )
-                for (response_url, _), result in zip(response_tasks, response_results):
-                    if isinstance(result, list):
-                        discoveries.extend(result)
-                    elif isinstance(result, Exception):
-                        self.logger.warning(
-                            "Response parse task failed response_url=%s error=%s",
-                            response_url,
-                            result,
-                            exc_info=(type(result), result, result.__traceback__),
-                        )
+                discoveries.extend(await self.drain_response_tasks(response_tasks, response_state))
 
             for raw_url, method in self.prioritize_discoveries(discoveries):
                 self.enqueue_url(raw_url, item.depth + 1, page.url, method)
@@ -2226,15 +2513,18 @@ class SiteCrawler:
     async def crawl(self) -> dict[str, Any]:
         processed_pages = 0
         hit_page_limit = False
-        active_tasks: Dict[asyncio.Task[None], QueueItem] = {}
+        active_tasks: Dict[asyncio.Task[None], Tuple[QueueItem, str, CrawlerSession]] = {}
         self.logger.info(
-            "Crawl start site=%s frontier=%s visited=%s discovered=%s page_limit=%s concurrency=%s",
+            "Crawl start site=%s frontier=%s visited=%s discovered=%s page_limit=%s concurrency=%s heavy_limit=%s light_limit=%s session_page_limit=%s",
             self.config.site_key,
             self.frontier_count(),
             len(self.visited_urls),
             len(self.discovered_urls),
             self.config.page_limit,
             self.config.max_concurrency,
+            self.effective_heavy_page_limit(),
+            self.effective_light_page_limit(),
+            self.sessions[0].max_pages if self.sessions else 0,
         )
         while self.frontier or active_tasks:
             while self.frontier and len(active_tasks) < self.config.max_concurrency:
@@ -2250,16 +2540,27 @@ class SiteCrawler:
                             len(active_tasks),
                         )
                     break
-                item = self.frontier.popleft()
+                session = self.reserve_dispatch_session()
+                if session is None:
+                    break
+                selected = self.pop_next_dispatchable_item()
+                if selected is None:
+                    self.release_dispatch_session(session)
+                    break
+                item, workload_class = selected
                 self.active_queue_items[item.url] = item
-                active_tasks[asyncio.create_task(self.process_page(item))] = item
+                self.reserve_workload_slot(workload_class)
+                active_tasks[asyncio.create_task(self.process_page(item, session, workload_class))] = (item, workload_class, session)
                 processed_pages += 1
                 self.logger.debug(
-                    "Dispatched URL site=%s processed=%s active=%s frontier=%s url=%s",
+                    "Dispatched URL site=%s processed=%s active=%s frontier=%s workload=%s session=%s session_active=%s url=%s",
                     self.config.site_key,
                     processed_pages,
                     len(active_tasks),
                     len(self.frontier),
+                    workload_class,
+                    session.index,
+                    session.active_pages,
                     item.url,
                 )
 
@@ -2269,19 +2570,22 @@ class SiteCrawler:
             visits_before = len(self.visits)
             done, _ = await asyncio.wait(active_tasks.keys(), return_when=asyncio.FIRST_COMPLETED)
             for task in done:
-                item = active_tasks.pop(task)
+                item, workload_class, session = active_tasks.pop(task)
                 self.active_queue_items.pop(item.url, None)
                 try:
                     await task
                 except Exception:
                     self.logger.exception("Crawler worker crashed site=%s url=%s", self.config.site_key, item.url)
+                finally:
+                    self.release_workload_slot(workload_class)
+                    self.release_dispatch_session(session)
             completed_count = len(done)
             self.pages_since_checkpoint += completed_count
             new_visits = self.visits[visits_before:]
             completed_ok = sum(1 for visit in new_visits if visit.ok)
             completed_failed = len(new_visits) - completed_ok
             self.logger.info(
-                "Worker tick site=%s finished=%s ok=%s failed=%s active=%s frontier=%s visited=%s discovered=%s",
+                "Worker tick site=%s finished=%s ok=%s failed=%s active=%s frontier=%s visited=%s discovered=%s heavy_active=%s light_active=%s",
                 self.config.site_key,
                 completed_count,
                 completed_ok,
@@ -2290,6 +2594,8 @@ class SiteCrawler:
                 len(self.frontier),
                 len(self.visited_urls),
                 len(self.discovered_urls),
+                self.active_page_counts.get("heavy", 0),
+                self.active_page_counts.get("light", 0),
             )
             self.save_checkpoint()
 
@@ -2357,6 +2663,13 @@ class SiteCrawler:
                 "proxy_session_count": proxy_session_count,
                 "skip_failed_proxies": self.config.skip_failed_proxies,
                 "max_concurrency": self.config.max_concurrency,
+                "max_heavy_page_concurrency": self.effective_heavy_page_limit(),
+                "max_light_page_concurrency": self.effective_light_page_limit(),
+                "max_pages_per_session": self.sessions[0].max_pages if self.sessions else self.effective_session_page_limit(max(1, len(self.build_session_proxies()))),
+                "max_api_expansion_concurrency": self.effective_api_expansion_limit(),
+                "heavy_page_settle_ms": self.config.heavy_page_settle_ms,
+                "light_page_settle_ms": self.config.light_page_settle_ms,
+                "response_grace_ms": self.config.response_grace_ms,
                 "write_full_outputs_on_checkpoint": self.config.write_full_outputs_on_checkpoint,
                 "enable_cbpt_portal_ajax_expansion": self.config.enable_cbpt_portal_ajax_expansion,
                 "max_cbpt_portal_ajax_requests_per_page": self.config.max_cbpt_portal_ajax_requests_per_page,

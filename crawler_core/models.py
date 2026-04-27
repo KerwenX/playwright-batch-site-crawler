@@ -65,8 +65,15 @@ class BatchConfig:
     headless: bool = True
     max_concurrency: int = 8
     max_site_concurrency: int = 1
+    max_heavy_page_concurrency: int = 0
+    max_light_page_concurrency: int = 0
+    max_pages_per_session: int = 0
+    max_api_expansion_concurrency: int = 0
     page_timeout_ms: int = 20000
     settle_ms: int = 900
+    heavy_page_settle_ms: int = 1800
+    light_page_settle_ms: int = 500
+    response_grace_ms: int = 1200
     max_pages_per_site: int = 0
     checkpoint_every_pages: int = 10
     checkpoint_every_seconds: int = 30
@@ -100,8 +107,15 @@ class BatchConfig:
             headless=bool(payload.get("headless", True)),
             max_concurrency=int(payload.get("max_concurrency", 8)),
             max_site_concurrency=max(1, int(payload.get("max_site_concurrency", 1))),
+            max_heavy_page_concurrency=max(0, int(payload.get("max_heavy_page_concurrency", 0))),
+            max_light_page_concurrency=max(0, int(payload.get("max_light_page_concurrency", 0))),
+            max_pages_per_session=max(0, int(payload.get("max_pages_per_session", 0))),
+            max_api_expansion_concurrency=max(0, int(payload.get("max_api_expansion_concurrency", 0))),
             page_timeout_ms=int(payload.get("page_timeout_ms", 20000)),
             settle_ms=int(payload.get("settle_ms", 900)),
+            heavy_page_settle_ms=max(0, int(payload.get("heavy_page_settle_ms", payload.get("settle_ms", 900)))),
+            light_page_settle_ms=max(0, int(payload.get("light_page_settle_ms", min(int(payload.get("settle_ms", 900)), 500)))),
+            response_grace_ms=max(0, int(payload.get("response_grace_ms", 1200))),
             max_pages_per_site=int(payload.get("max_pages_per_site", 0)),
             checkpoint_every_pages=max(1, int(payload.get("checkpoint_every_pages", 10))),
             checkpoint_every_seconds=max(1, int(payload.get("checkpoint_every_seconds", 30))),
@@ -136,8 +150,15 @@ class SiteConfig:
     log_to_file: bool
     headless: bool
     max_concurrency: int
+    max_heavy_page_concurrency: int
+    max_light_page_concurrency: int
+    max_pages_per_session: int
+    max_api_expansion_concurrency: int
     timeout_ms: int
     settle_ms: int
+    heavy_page_settle_ms: int
+    light_page_settle_ms: int
+    response_grace_ms: int
     page_limit: int
     checkpoint_every_pages: int
     checkpoint_every_seconds: int
@@ -164,3 +185,6 @@ class CrawlerSession:
     browser: Browser
     context: BrowserContext
     api_context: Any
+    api_mode: str = "request"
+    active_pages: int = 0
+    max_pages: int = 0

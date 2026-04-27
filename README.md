@@ -173,12 +173,18 @@ docker run --rm -it \
 
 ## 高并发优化
 
-这一版针对“站点很多、需要持续跑批”的场景，核心改动有四个：
+这一版针对“站点很多、需要持续跑批”的场景，核心改动有五个：
 
 - `max_site_concurrency`
   站点级并发，多个站点可以同时跑，不再串行等待。
 - 站内动态 worker
   不再按固定 batch 整批等待，而是哪个页面先结束就立刻补下一个，减少慢页拖尾。
+- 单站点分层调度
+  页面会区分为重页面和轻页面，目录页、期次页、首页优先深挖；正文页、详情页走更轻的等待策略。
+- 浏览器池与会话压力控制
+  每个站点会复用少量浏览器会话，并限制单个会话同时承载的页面数，避免把单个代理或单个 context 压爆。
+- 响应收尾窗口
+  页面主流程结束后会继续等待一小段时间，把慢代理下晚到的 `xhr/fetch/script` 也尽量吸收进发现结果。
 - 轻量 checkpoint
   `write_full_outputs_on_checkpoint = false` 时，周期性 checkpoint 只刷新 `summary.json` 和 `checkpoint.json`，大幅降低高并发场景下的磁盘写放大。
 - 共享 Playwright
@@ -189,6 +195,13 @@ docker run --rm -it \
 - `max_site_concurrency = 4`
 - `max_concurrency = 12`
 - `proxy_session_count = 12`
+- `max_heavy_page_concurrency = 6`
+- `max_light_page_concurrency = 12`
+- `max_pages_per_session = 0`
+- `max_api_expansion_concurrency = 16`
+- `heavy_page_settle_ms = 2500`
+- `light_page_settle_ms = 700`
+- `response_grace_ms = 1800`
 - `checkpoint_every_pages = 100`
 - `checkpoint_every_seconds = 180`
 - `write_full_outputs_on_checkpoint = false`
@@ -216,11 +229,25 @@ docker run --rm -it \
 - `chromium_executable_path`
   留空使用 Playwright 默认 Chromium；填写后使用指定浏览器路径。
 - `max_concurrency`
-  单站点并发页面数。
+  单站点总并发页面数。
 - `max_site_concurrency`
   站点级并发任务数；服务器上建议大于 `1`。
+- `max_heavy_page_concurrency`
+  单站点同时允许多少个“重页面”并发。重页面通常是首页、目录页、期次页、分页页。
+- `max_light_page_concurrency`
+  单站点同时允许多少个“轻页面”并发。轻页面通常是正文页、详情页、新闻页。
+- `max_pages_per_session`
+  单个浏览器会话同时允许承载多少个页面；`0` 表示按 `max_concurrency / session_count` 自动推导。
+- `max_api_expansion_concurrency`
+  页面内 API 扩展并发上限，用来限制 AJCASS / Boyuan / CNKI 这类接口型站点的额外请求风暴。
 - `max_pages_per_site`
   单站点最大访问页数，`0` 表示不限制。
+- `heavy_page_settle_ms`
+  重页面额外稳定等待时间。通常服务器上应明显高于轻页面。
+- `light_page_settle_ms`
+  轻页面额外稳定等待时间。用于正文页、详情页这类低成本页面。
+- `response_grace_ms`
+  页面主流程结束后的响应收尾窗口，专门用来接住代理慢、延迟高时晚到的响应。
 - `write_full_outputs_on_checkpoint`
   `true` 时每次 checkpoint 都会重写 `nodes/edges/visits/all_urls` 明细；`false` 时只写 `summary.json + checkpoint.json`，适合高并发服务器。
 - `visit_leaf_pages`
@@ -236,7 +263,7 @@ docker run --rm -it \
 - `proxy_servers`
   代理池，可为字符串列表，也可为对象列表。
 - `proxy_session_count`
-  每个站点启用多少个代理会话。
+  每个站点初始化多少个浏览器会话；代理数量少于会话数时，会循环复用代理。
 - `skip_failed_proxies`
   坏代理是否自动跳过。
 - `browser_launch_args`
