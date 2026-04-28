@@ -66,6 +66,7 @@ class BatchConfig:
     log_to_file: bool = True
     headless: bool = True
     aggressive_same_site_crawl: bool = True
+    worker_process_count: int = 1
     max_concurrency: int = 8
     max_site_concurrency: int = 1
     max_heavy_page_concurrency: int = 0
@@ -117,6 +118,7 @@ class BatchConfig:
             log_to_file=bool(payload.get("log_to_file", True)),
             headless=bool(payload.get("headless", True)),
             aggressive_same_site_crawl=bool(payload.get("aggressive_same_site_crawl", True)),
+            worker_process_count=max(1, int(payload.get("worker_process_count", 1))),
             max_concurrency=int(payload.get("max_concurrency", 8)),
             max_site_concurrency=max(1, int(payload.get("max_site_concurrency", 1))),
             max_heavy_page_concurrency=max(0, int(payload.get("max_heavy_page_concurrency", 0))),
