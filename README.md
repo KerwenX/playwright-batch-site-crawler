@@ -516,3 +516,34 @@ crawl_output_batch/
 
 - 代码仓库默认公开配置结构，不对字段做隐藏处理。
 - 当前仍会记录部分站点内部的低价值辅助 URL，但它们不会重复入队，也不会影响断点续传。
+
+## 多进程运行
+
+高并发服务器场景下，可以通过 `worker_process_count` 把整批站点切分到多个独立 Python 进程里运行。
+
+- `worker_process_count`
+  控制父调度器会启动多少个子进程。
+- 每个子进程都有自己独立的 Playwright driver 池、browser 实例和 browser context。
+- 这可以明显降低 `BrowserContext.new_page: Connection closed while reading from the driver` 这类错误对整批任务的影响范围。
+- 父进程会自动把 `max_site_concurrency` 和 `playwright_driver_pool_size` 按 worker 数量做切分。
+- 子进程共享同一个 `output_root`，所以站点目录、checkpoint、断点续传语义不变；最终全局 `batch_summary.json`、`all_discovered_urls.*`、`sites_summary.csv` 仍由父进程统一汇总。
+
+服务端建议：
+
+- 优先增加 `worker_process_count`，再继续把单个进程内的站点数压得很高。
+- Docker 不要继续使用过小的共享内存，建议 `--shm-size=16g` 以上，或直接 `--ipc=host`。
+- 如果只想降低 driver 断连风险，至少同时开启：
+  - `worker_process_count > 1`
+  - `playwright_driver_pool_size > 1`
+  - `transient_page_retry_limit >= 2`
+  - `session_rebuild_retries >= 2`
+
+示例：
+
+```json
+{
+  "worker_process_count": 4,
+  "max_site_concurrency": 32,
+  "playwright_driver_pool_size": 4
+}
+```
