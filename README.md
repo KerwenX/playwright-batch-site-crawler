@@ -547,3 +547,46 @@ crawl_output_batch/
   "playwright_driver_pool_size": 4
 }
 ```
+
+## 2026-04 Representative Coverage Fixes
+
+Representative sites used in this validation pass:
+
+- `https://zgncjj.ajcass.com`
+- `https://www.jqte.net`
+- `https://gggl.cbpt.cnki.net`
+- `https://BJFY.cbpt.cnki.net`
+
+This pass focused on one rule: if a representative site stayed well below `2000` discovered URLs, the crawler was still missing a real expansion path.
+
+### Root causes that were fixed
+
+- Generic journal sites such as `jqte.net` exposed issue navigation through inline JavaScript arrays like `yearID[]` and `quarterNameID[]`. Plain DOM link extraction was not enough.
+- Classic non-portal `cbpt.cnki.net` sites such as `BJFY.cbpt.cnki.net` exposed year pages and issue pages through server-rendered HTML lists. Browser-only traversal was too shallow and too slow to expand them completely.
+- Some same-site helper endpoints and error pages were still being queued in aggressive mode, including download/helper endpoints and `404.htm?aspxerrorpath=...` style URLs.
+- Relative URL extraction from rendered DOM and HTML fragments was still too weak for older journal templates.
+- Generic click-probe discovery had a settle-path bug, so successful in-page interactions did not always lead to follow-up extraction.
+
+### Coverage fixes in this version
+
+- Added generic issue-list synthesis for `issue_list.aspx` pages backed by `yearID[]` and `quarterNameID[]` script data.
+- Added recursive HTTP expansion for classic non-portal CBPT list pages such as `wkTextContent.aspx` and `wkList.aspx`, so year pages, issue pages, and article lists can continue expanding without waiting only on browser navigation.
+- Reordered aggressive queueing so obvious helper/download/error endpoints are still excluded before enqueueing.
+- Normalized relative DOM and HTML-fragment URLs against the current page URL before queueing them.
+- Fixed the generic click-probe settle flow so interactive discoveries are retained.
+- Added extra filtering for `.swf` and common 404/500 error-page URLs.
+
+### Representative local validation
+
+| Site | Discovered URLs | Queueable URLs | Visited Pages | Failed Visits |
+| --- | ---: | ---: | ---: | ---: |
+| `zgncjj.ajcass.com` | `4298` | `2174` | `120` | `0` |
+| `www.jqte.net` | `2365` | `1689` | `120` | `2` |
+| `gggl.cbpt.cnki.net` | `4388` | `1612` | `185` | `0` |
+| `BJFY.cbpt.cnki.net` | `6245` | `2970` | `15` | `0` |
+
+For `BJFY.cbpt.cnki.net`, the older crawl path was only discovering about `612` URLs before the classic CBPT recursive expansion fix. After the new expansion path was added, the same representative run discovered `6245` URLs.
+
+### Operational guidance
+
+For heavy AJCASS and CBPT sites, discovered URL count is a better health signal than raw page throughput. If a representative site that should expose years, issues, or article lists remains far below `2000` discovered URLs, the crawler is still missing a real expansion path and should be debugged before scaling out.

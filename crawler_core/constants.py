@@ -70,6 +70,7 @@ NON_HTML_SUFFIXES = {
     ".pptx",
     ".rar",
     ".rtf",
+    ".swf",
     ".svg",
     ".tar",
     ".tgz",
@@ -92,6 +93,18 @@ HASH_ROUTE_REGEX = re.compile(r"#/[A-Za-z0-9_./?=&%-]+")
 HTML_ATTR_REGEX = re.compile(
     r"(?P<attr>href|src|action|data-href|data-url|data-src|poster|onclick)\s*=\s*(?P<quote>[\"'])(?P<value>.*?)(?P=quote)",
     re.IGNORECASE | re.DOTALL,
+)
+GENERIC_ISSUE_LIST_ACTION_REGEX = re.compile(
+    r"(?:action|href)\s*=\s*(?P<quote>[\"'])(?P<value>[^\"']*issue_list\.aspx[^\"']*)(?P=quote)",
+    re.IGNORECASE,
+)
+GENERIC_YEAR_ID_REGEX = re.compile(
+    r"yearid\s*\[\s*\d+\s*\]\s*=\s*[\"'](?P<year>\d{4})[\"']",
+    re.IGNORECASE,
+)
+GENERIC_QUARTER_NAME_ID_REGEX = re.compile(
+    r"quarternameid\s*\[\s*\d+\s*\]\s*=\s*[\"'](?P<year>\d{4}):(?P<quarter>\d{1,2}):[^\"']+[\"']",
+    re.IGNORECASE,
 )
 GENERIC_SCRIPT_ROUTE_REGEX = re.compile(
     r"(?:path|redirect|to)\s*:\s*[\"'](?P<route>/[A-Za-z0-9_./?=&%-]*)[\"']",
@@ -197,10 +210,19 @@ NON_NAVIGATIONAL_ENDPOINT_FILENAMES = {
     "articledownloadcontrol.do",
     "existscnctstinarticle.do",
     "exportcitation.do",
+    "downloadissueinfo.aspx",
     "getdianjishu.jsp",
     "getdianjirichhtmlshu.jsp",
+    "getchinesdownloadinfobyenglishpaper",
+    "getchineseenglishquotepaperformat",
+    "gotocnkinodeurl",
     "getxiazaishu.jsp",
+    "kbdownload.aspx",
+    "listprepaperornextpaper",
+    "paperpage_list",
+    "recommendbydocid",
     "showalertinfo.do",
+    "wkdownfilebylink.aspx",
     "waf_slider_captcha",
     "waf_slider_verify.html",
 }
