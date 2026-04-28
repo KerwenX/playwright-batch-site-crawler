@@ -6,6 +6,7 @@
   "log_to_file": true,
   "headless": true,
   "aggressive_same_site_crawl": true,
+  "worker_process_count": 1,
   "max_concurrency": 8,
   "max_site_concurrency": 1,
   "max_heavy_page_concurrency": 8,
