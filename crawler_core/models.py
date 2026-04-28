@@ -224,4 +224,6 @@ class CrawlerSession:
     rebuild_count: int = 0
     unhealthy_until: float = 0.0
     last_error: str = ""
+    draining: bool = False
+    pending_rebuild_reason: str = ""
     rebuild_lock: Any = field(default_factory=asyncio.Lock)

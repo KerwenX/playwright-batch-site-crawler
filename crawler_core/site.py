@@ -201,6 +201,7 @@ class SiteCrawler:
             session.context is not None
             and session.browser is not None
             and session.active_pages < session.max_pages
+            and not session.draining
             and not self.session_on_cooldown(session)
         )
 
@@ -245,10 +246,24 @@ class SiteCrawler:
         session.unhealthy_until = 0.0
         session.last_error = ""
 
+    def mark_session_draining(self, session: CrawlerSession, reason: str) -> None:
+        if not session.draining:
+            self.logger.warning(
+                "Session marked draining site=%s session=%s proxy=%s active_pages=%s reason=%s",
+                self.config.site_key,
+                session.index,
+                session.proxy_label,
+                session.active_pages,
+                reason,
+            )
+        session.draining = True
+        session.pending_rebuild_reason = reason
+
     async def rebuild_session(self, session: CrawlerSession, reason: str) -> bool:
         async with session.rebuild_lock:
-            if session.active_pages > 1 and session.context is not None and session.browser is not None and not self.session_on_cooldown(session):
-                return True
+            if session.active_pages > 1:
+                self.mark_session_draining(session, reason)
+                return False
             await self.dispose_session_resources(session)
             try:
                 browser, context, api_context, api_mode = await self.launch_session_resources(
@@ -271,6 +286,8 @@ class SiteCrawler:
             session.api_mode = api_mode
             session.rebuild_count += 1
             self.mark_session_success(session)
+            session.draining = False
+            session.pending_rebuild_reason = ""
             self.logger.info(
                 "Session rebuilt site=%s session=%s proxy=%s rebuild_count=%s reason=%s",
                 self.config.site_key,
@@ -280,6 +297,15 @@ class SiteCrawler:
                 reason,
             )
             return True
+
+    async def recover_draining_sessions(self) -> None:
+        for session in self.sessions:
+            if not session.draining:
+                continue
+            if session.active_pages > 0 or self.session_on_cooldown(session):
+                continue
+            reason = session.pending_rebuild_reason or "drain-recovery"
+            await self.rebuild_session(session, reason)
 
     async def __aenter__(self) -> "SiteCrawler":
         if self.shared_playwright is not None:
@@ -428,6 +454,33 @@ class SiteCrawler:
         if self.config.max_pages_per_session > 0:
             return self.config.max_pages_per_session
         return max(1, math.ceil(self.config.max_concurrency / max(1, session_count)))
+
+    def queue_retry_limit(self) -> int:
+        return max(2, 1 + self.config.transient_page_retry_limit + self.config.session_rebuild_retries)
+
+    def queue_retry_allowed(self, item: QueueItem) -> bool:
+        return item.attempts < self.queue_retry_limit()
+
+    def requeue_queue_item(self, item: QueueItem, reason: str) -> bool:
+        if not self.queue_retry_allowed(item):
+            return False
+        retry_item = QueueItem(
+            url=item.url,
+            depth=item.depth,
+            discovered_from=item.discovered_from,
+            discovery_method=item.discovery_method,
+            attempts=item.attempts,
+        )
+        self.frontier.appendleft(retry_item)
+        self.logger.warning(
+            "Requeued URL after transport/session failure site=%s dispatch_attempt=%s/%s reason=%s url=%s",
+            self.config.site_key,
+            retry_item.attempts,
+            self.queue_retry_limit(),
+            reason,
+            retry_item.url,
+        )
+        return True
 
     def page_workload_class(self, url: str) -> str:
         if self.config.aggressive_same_site_crawl:
@@ -2805,6 +2858,7 @@ class SiteCrawler:
             started_at=time.time(),
         )
         page_attempt_limit = max(1, 1 + self.config.transient_page_retry_limit)
+        queue_requeued = False
         for page_attempt in range(1, page_attempt_limit + 1):
             page: Optional[Page] = None
             response_tasks: list[tuple[str, asyncio.Task[list[tuple[str, str]]]]] = []
@@ -2931,7 +2985,13 @@ class SiteCrawler:
                 break
             except Exception as exc:
                 transport_error = self.is_session_transport_error(exc)
-                if transport_error and page_attempt < page_attempt_limit:
+                if transport_error:
+                    await self.mark_session_failure(session, exc, "transport")
+                    self.mark_session_draining(
+                        session,
+                        "transport:{0}:attempt:{1}".format(item.url, page_attempt),
+                    )
+                if transport_error and page_attempt < page_attempt_limit and session.active_pages <= 1:
                     self.logger.warning(
                         "Transient transport error site=%s session=%s proxy=%s attempt=%s/%s url=%s error=%s",
                         self.config.site_key,
@@ -2954,6 +3014,11 @@ class SiteCrawler:
                         await asyncio.sleep(max(0.25, min(2.0, self.next_session_available_delay() or 0.5)))
                     if recovered:
                         continue
+                if transport_error:
+                    queue_requeued = self.requeue_queue_item(
+                        item,
+                        "transport-error:session:{0}:attempt:{1}".format(session.index, page_attempt),
+                    )
 
                 visit.error = traceback.format_exc()
                 self.logger.exception(
@@ -2975,7 +3040,8 @@ class SiteCrawler:
 
         visit.finished_at = time.time()
         self.visits.append(visit)
-        self.visited_urls.add(item.url)
+        if not queue_requeued:
+            self.visited_urls.add(item.url)
         if visit.ok:
             self.logger.info(
                 "Visit ok depth=%s final_kind=%s proxy=%s discoveries=%s duration_ms=%s requested=%s final=%s title=%s",
@@ -2987,6 +3053,15 @@ class SiteCrawler:
                 item.url,
                 visit.final_url,
                 truncate_text(visit.title),
+            )
+        elif queue_requeued:
+            self.logger.warning(
+                "Visit deferred for queue retry depth=%s dispatch_attempt=%s/%s proxy=%s requested=%s",
+                item.depth,
+                item.attempts,
+                self.queue_retry_limit(),
+                visit.proxy,
+                item.url,
             )
 
     async def crawl(self) -> dict[str, Any]:
@@ -3006,6 +3081,7 @@ class SiteCrawler:
             self.sessions[0].max_pages if self.sessions else 0,
         )
         while self.frontier or active_tasks:
+            await self.recover_draining_sessions()
             while self.frontier and len(active_tasks) < self.config.max_concurrency:
                 if self.config.page_limit and processed_pages >= self.config.page_limit:
                     if not hit_page_limit:
@@ -3027,6 +3103,7 @@ class SiteCrawler:
                     self.release_dispatch_session(session)
                     break
                 item, workload_class = selected
+                item.attempts += 1
                 self.active_queue_items[item.url] = item
                 self.reserve_workload_slot(workload_class)
                 active_tasks[asyncio.create_task(self.process_page(item, session, workload_class))] = (item, workload_class, session)
