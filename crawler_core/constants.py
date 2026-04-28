@@ -4,7 +4,7 @@ import re
 
 DEFAULT_CONFIG_PATH = "config.json"
 DEFAULT_INPUT_URLS_FILE = "input_urls.txt"
-CRAWL_POLICY_VERSION = 4
+CRAWL_POLICY_VERSION = 5
 AJCASS_HOST = "zgncjj.ajcass.com"
 AJCASS_HOST_SUFFIX = ".ajcass.com"
 AJCASS_SITE_CONTENT_API = "https://api.ajcass.com/api/JournalInfoApi/GetSiteContentPageList"
@@ -234,6 +234,10 @@ DEFAULT_BLOCKED_RESOURCE_TYPES = [
 ]
 DEFAULT_BLOCKED_URL_SUFFIXES = [
     ".bmp",
+    ".csv",
+    ".doc",
+    ".docx",
+    ".epub",
     ".eot",
     ".gif",
     ".ico",
@@ -242,14 +246,22 @@ DEFAULT_BLOCKED_URL_SUFFIXES = [
     ".m4s",
     ".mp3",
     ".mp4",
+    ".pdf",
     ".png",
+    ".ppt",
+    ".pptx",
+    ".rar",
     ".svg",
+    ".tar",
     ".ttf",
     ".wav",
     ".webm",
     ".webp",
     ".woff",
     ".woff2",
+    ".xls",
+    ".xlsx",
+    ".zip",
 ]
 FORCE_OPEN_SHADOW_ROOTS_SCRIPT = """(function() {
     if (!Element.prototype._attachShadow) {

@@ -186,7 +186,9 @@ docker run --rm -it \
 
 ## 高并发优化
 
-这一版针对“站点很多、需要持续跑批”的场景，核心改动有五个：
+这一版默认采用“同站点激进全量 BFS”策略，除了图片、脚本、样式、音视频、压缩包、Office/PDF 等明显非 HTML 资源，以及明显危险动作 URL 之外，只要是同站点 `http/https` URL 就会记录并尽量入队访问。当前版本不再依赖“索引页/叶子页”判断来决定是否继续向下爬。
+
+针对“站点很多、需要持续跑批”的场景，核心改动有这些：
 
 - `max_site_concurrency`
   站点级并发，多个站点可以同时跑，不再串行等待。
@@ -210,7 +212,7 @@ docker run --rm -it \
 - `max_site_concurrency = 4`
 - `max_concurrency = 12`
 - `proxy_session_count = 12`
-- `max_heavy_page_concurrency = 6`
+- `max_heavy_page_concurrency = 12`
 - `max_light_page_concurrency = 12`
 - `max_pages_per_session = 0`
 - `max_api_expansion_concurrency = 16`
@@ -244,7 +246,7 @@ docker run --rm -it \
 - 关键取舍是：
   - 优先提高 `max_site_concurrency`，而不是把单站 `max_concurrency` 拉到极高。
   - 将 `proxy_session_count` 控制在 `3`，避免 2000 站点场景下每个站点都起太多 browser session。
-  - 用 `max_heavy_page_concurrency = 2` 控制目录页/期次页的深挖速度，用 `max_light_page_concurrency = 6` 放开正文和详情页的吞吐。
+  - 在 `aggressive_same_site_crawl = true` 下，建议把 `max_heavy_page_concurrency` 和 `max_light_page_concurrency` 都直接开到 `max_concurrency`，让所有同站点页面都按全量 BFS 尽快推进。
   - 用 `response_grace_ms = 1600` 和更高的 `page_timeout_ms` 保住代理环境下晚到响应的发现率。
   - 用 `playwright_driver_pool_size = 4` 分散共享 driver 压力；用 `transient_page_retry_limit = 2` 和 `session_rebuild_retries = 2` 吸收 `Connection closed while reading from the driver` 这类瞬时故障。
 
@@ -270,12 +272,14 @@ docker run --rm -it \
   留空使用 Playwright 默认 Chromium；填写后使用指定浏览器路径。
 - `max_concurrency`
   单站点总并发页面数。
+- `aggressive_same_site_crawl`
+  是否启用同站点激进全量 BFS。默认开启；开启后不再根据页面类型决定是否继续向下爬。
 - `max_site_concurrency`
   站点级并发任务数；服务器上建议大于 `1`。
 - `max_heavy_page_concurrency`
-  单站点同时允许多少个“重页面”并发。重页面通常是首页、目录页、期次页、分页页。
+  单站点同时允许多少个“重页面”并发。默认激进模式下建议直接设为 `max_concurrency`。
 - `max_light_page_concurrency`
-  单站点同时允许多少个“轻页面”并发。轻页面通常是正文页、详情页、新闻页。
+  单站点同时允许多少个“轻页面”并发。默认激进模式下建议直接设为 `max_concurrency`。
 - `max_pages_per_session`
   单个浏览器会话同时允许承载多少个页面；`0` 表示按 `max_concurrency / session_count` 自动推导。
 - `max_api_expansion_concurrency`

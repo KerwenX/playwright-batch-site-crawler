@@ -403,12 +403,16 @@ class SiteCrawler:
         return session
 
     def effective_heavy_page_limit(self) -> int:
+        if self.config.aggressive_same_site_crawl:
+            return self.config.max_concurrency
         configured = self.config.max_heavy_page_concurrency
         if configured > 0:
             return min(configured, self.config.max_concurrency)
         return max(1, min(self.config.max_concurrency, max(4, math.ceil(self.config.max_concurrency / 3))))
 
     def effective_light_page_limit(self) -> int:
+        if self.config.aggressive_same_site_crawl:
+            return self.config.max_concurrency
         configured = self.config.max_light_page_concurrency
         if configured > 0:
             return min(configured, self.config.max_concurrency)
@@ -426,6 +430,8 @@ class SiteCrawler:
         return max(1, math.ceil(self.config.max_concurrency / max(1, session_count)))
 
     def page_workload_class(self, url: str) -> str:
+        if self.config.aggressive_same_site_crawl:
+            return "heavy" if self.is_queueable(url) else "light"
         kind = self.page_kind(url)
         lowered_url = (self.normalize_url(url) or url).lower()
         path = urlsplit(lowered_url).path
@@ -497,6 +503,16 @@ class SiteCrawler:
 
     def pop_next_dispatchable_item(self) -> Optional[Tuple[QueueItem, str]]:
         if not self.frontier:
+            return None
+        if self.config.aggressive_same_site_crawl:
+            for index, item in enumerate(self.frontier):
+                workload_class = self.page_workload_class(item.url)
+                if not self.can_dispatch_workload(workload_class):
+                    continue
+                self.frontier.rotate(-index)
+                selected_item = self.frontier.popleft()
+                self.frontier.rotate(index)
+                return selected_item, workload_class
             return None
         best_index: Optional[int] = None
         best_workload_class = ""
@@ -1241,6 +1257,10 @@ class SiteCrawler:
             return False
         if is_probably_unsafe_action_url(normalized):
             return False
+        if self.config.aggressive_same_site_crawl:
+            if self.is_ajcass and parts.fragment:
+                return self.ajcass_route_from_url(normalized).startswith("/")
+            return True
         if is_probably_non_navigational_endpoint(normalized):
             return False
         if self.site_family == "cbpt_cnki":
@@ -1269,6 +1289,8 @@ class SiteCrawler:
         return True
 
     def should_visit_url(self, url: str) -> bool:
+        if self.config.aggressive_same_site_crawl:
+            return self.is_queueable(url)
         if not self.is_queueable(url):
             return False
         if self.config.visit_leaf_pages:
@@ -1310,6 +1332,11 @@ class SiteCrawler:
 
     def discovery_priority(self, raw_url: str, method: str) -> tuple[Any, ...]:
         normalized = self.normalize_url(raw_url) or raw_url
+        if self.config.aggressive_same_site_crawl:
+            return (
+                self.discovery_method_priority(method),
+                normalized,
+            )
         page_kind = self.page_kind(normalized) if self.is_queueable(normalized) else "resource"
         kind_rank = {
             "root": 0,
@@ -1353,6 +1380,8 @@ class SiteCrawler:
                 continue
             seen.add(key)
             unique.append((raw_url, method))
+        if self.config.aggressive_same_site_crawl:
+            return unique
         return sorted(unique, key=lambda item: self.discovery_priority(item[0], item[1]))
 
     def build_ajcass_issue_url(
@@ -3124,6 +3153,7 @@ class SiteCrawler:
                 "proxy_servers_count": len(self.config.proxy_servers),
                 "proxy_session_count": proxy_session_count,
                 "skip_failed_proxies": self.config.skip_failed_proxies,
+                "aggressive_same_site_crawl": self.config.aggressive_same_site_crawl,
                 "max_concurrency": self.config.max_concurrency,
                 "max_heavy_page_concurrency": self.effective_heavy_page_limit(),
                 "max_light_page_concurrency": self.effective_light_page_limit(),

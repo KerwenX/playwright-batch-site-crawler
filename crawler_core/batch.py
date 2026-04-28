@@ -29,11 +29,12 @@ class BatchRunner:
             log_file=(self.output_root / "batch.log") if self.batch_config.log_to_file else None,
         )
         self.logger.info(
-            "Batch runner initialized config=%s output_root=%s log_level=%s chromium_executable_path=%s max_site_concurrency=%s playwright_driver_pool_size=%s write_full_outputs_on_checkpoint=%s",
+            "Batch runner initialized config=%s output_root=%s log_level=%s chromium_executable_path=%s aggressive_same_site_crawl=%s max_site_concurrency=%s playwright_driver_pool_size=%s write_full_outputs_on_checkpoint=%s",
             self.config_path,
             self.output_root,
             self.batch_config.log_level,
             self.batch_config.chromium_executable_path or "<playwright-default>",
+            self.batch_config.aggressive_same_site_crawl,
             self.batch_config.max_site_concurrency,
             self.batch_config.playwright_driver_pool_size,
             self.batch_config.write_full_outputs_on_checkpoint,
@@ -60,6 +61,7 @@ class BatchRunner:
                     log_level=self.batch_config.log_level,
                     log_to_file=self.batch_config.log_to_file,
                     headless=self.batch_config.headless,
+                    aggressive_same_site_crawl=self.batch_config.aggressive_same_site_crawl,
                     max_concurrency=self.batch_config.max_concurrency,
                     max_heavy_page_concurrency=self.batch_config.max_heavy_page_concurrency,
                     max_light_page_concurrency=self.batch_config.max_light_page_concurrency,

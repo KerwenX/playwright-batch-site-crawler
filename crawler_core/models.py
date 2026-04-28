@@ -65,6 +65,7 @@ class BatchConfig:
     log_level: str = "INFO"
     log_to_file: bool = True
     headless: bool = True
+    aggressive_same_site_crawl: bool = True
     max_concurrency: int = 8
     max_site_concurrency: int = 1
     max_heavy_page_concurrency: int = 0
@@ -85,7 +86,7 @@ class BatchConfig:
     visit_leaf_pages: bool = True
     include_site_homepage_seed: bool = True
     enable_generic_interactions: bool = True
-    max_interaction_clicks_per_page: int = 18
+    max_interaction_clicks_per_page: int = 40
     enable_cbpt_portal_ajax_expansion: bool = True
     max_cbpt_portal_ajax_requests_per_page: int = 12
     max_api_pages_per_series: int = 0
@@ -115,6 +116,7 @@ class BatchConfig:
             log_level=str(payload.get("log_level", "INFO")).upper(),
             log_to_file=bool(payload.get("log_to_file", True)),
             headless=bool(payload.get("headless", True)),
+            aggressive_same_site_crawl=bool(payload.get("aggressive_same_site_crawl", True)),
             max_concurrency=int(payload.get("max_concurrency", 8)),
             max_site_concurrency=max(1, int(payload.get("max_site_concurrency", 1))),
             max_heavy_page_concurrency=max(0, int(payload.get("max_heavy_page_concurrency", 0))),
@@ -135,7 +137,7 @@ class BatchConfig:
             visit_leaf_pages=bool(payload.get("visit_leaf_pages", True)),
             include_site_homepage_seed=bool(payload.get("include_site_homepage_seed", True)),
             enable_generic_interactions=bool(payload.get("enable_generic_interactions", True)),
-            max_interaction_clicks_per_page=max(0, int(payload.get("max_interaction_clicks_per_page", 18))),
+            max_interaction_clicks_per_page=max(0, int(payload.get("max_interaction_clicks_per_page", 40))),
             enable_cbpt_portal_ajax_expansion=bool(payload.get("enable_cbpt_portal_ajax_expansion", True)),
             max_cbpt_portal_ajax_requests_per_page=max(0, int(payload.get("max_cbpt_portal_ajax_requests_per_page", 12))),
             max_api_pages_per_series=max(0, int(payload.get("max_api_pages_per_series", 0))),
@@ -167,6 +169,7 @@ class SiteConfig:
     log_level: str
     log_to_file: bool
     headless: bool
+    aggressive_same_site_crawl: bool
     max_concurrency: int
     max_heavy_page_concurrency: int
     max_light_page_concurrency: int
