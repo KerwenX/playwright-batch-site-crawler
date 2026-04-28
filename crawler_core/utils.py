@@ -11,6 +11,12 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from .constants import *
 
+def normalize_query_key(key: str) -> str:
+    normalized = str(key or "")
+    while normalized.lower().startswith("amp;"):
+        normalized = normalized[4:]
+    return normalized
+
 def atomic_write_text(path: Path, content: str) -> None:
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     tmp_path.write_text(content, encoding="utf-8")
@@ -217,9 +223,14 @@ def is_probably_non_navigational_endpoint(url: str) -> bool:
     parts = urlsplit(url)
     lowered_path = parts.path.lower()
     filename = get_path_filename(lowered_path)
+    lowered_query = parts.query.lower()
     if any(lowered_path.startswith(prefix) for prefix in LOW_PRIORITY_NAVIGATION_PREFIXES):
         return True
     if filename in NON_NAVIGATIONAL_ENDPOINT_FILENAMES:
+        return True
+    if filename in {"404.htm", "404.html", "404.aspx", "500.htm", "500.html", "500.aspx"}:
+        return True
+    if "aspxerrorpath=" in lowered_query:
         return True
     return False
 
@@ -246,10 +257,11 @@ def checkpoint_matches_current_policy(checkpoint: Dict[str, Any], visit_leaf_pag
 
 def sort_query(query: str) -> str:
     params = [
-        (key, value)
+        (normalize_query_key(key), value)
         for key, value in parse_qsl(query, keep_blank_values=True)
-        if key not in TRACKING_QUERY_KEYS and value != ""
+        if normalize_query_key(key) not in TRACKING_QUERY_KEYS and value != ""
     ]
+    params = [(key, value) for key, value in params if key]
     return urlencode(sorted(params), doseq=True)
 
 

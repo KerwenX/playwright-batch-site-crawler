@@ -1059,7 +1059,7 @@ class SiteCrawler:
             ]
         return []
 
-    def extract_urls_from_html_fragment(self, html_text: str) -> List[str]:
+    def extract_urls_from_html_fragment(self, html_text: str, source_url: Optional[str] = None) -> List[str]:
         urls: List[str] = []
         for match in HTML_ATTR_REGEX.finditer(html_text or ""):
             attr = (match.group("attr") or "").lower()
@@ -1070,9 +1070,56 @@ class SiteCrawler:
             if attr == "onclick":
                 urls.extend(self.extract_cbpt_portal_urls_from_onclick(value))
             elif self.is_urlish_attribute_value(value):
-                urls.append(value)
+                urls.append(self.normalize_url(value, base_url=source_url) or value)
         urls.extend(self.extract_urls_from_string(html_text or "", allow_relative=False))
+        urls.extend(self.extract_generic_issue_list_urls_from_html(html_text or "", source_url=source_url))
         return urls
+
+    def extract_generic_issue_list_urls_from_html(self, html_text: str, *, source_url: Optional[str] = None) -> List[str]:
+        if self.is_ajcass or self.site_family == "cbpt_cnki":
+            return []
+        lowered = html_text.lower()
+        if "issue_list.aspx" not in lowered or "quarternameid" not in lowered:
+            return []
+
+        year_ids = {match.group("year") for match in GENERIC_YEAR_ID_REGEX.finditer(html_text)}
+        issue_pairs: Set[Tuple[str, str]] = set()
+        for match in GENERIC_QUARTER_NAME_ID_REGEX.finditer(html_text):
+            year = match.group("year")
+            quarter = match.group("quarter")
+            if year not in year_ids:
+                continue
+            try:
+                normalized_quarter = str(int(quarter))
+            except Exception:
+                continue
+            issue_pairs.add((year, normalized_quarter))
+        if not issue_pairs:
+            return []
+
+        action_urls: Set[str] = set()
+        for match in GENERIC_ISSUE_LIST_ACTION_REGEX.finditer(html_text):
+            candidate = html_lib.unescape(match.group("value") or "").strip()
+            if candidate:
+                action_urls.add(candidate)
+        if not action_urls:
+            return []
+
+        discovered: List[str] = []
+        seen: Set[str] = set()
+        for action_url in action_urls:
+            normalized_action = self.normalize_url(action_url, base_url=source_url or (self.site_origin + "/"))
+            if not normalized_action:
+                continue
+            parts = urlsplit(normalized_action)
+            base_issue_url = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+            for year, quarter in sorted(issue_pairs):
+                issue_url = f"{base_issue_url}?{urlencode([('year_id', year), ('quarter_id', quarter)])}"
+                if issue_url in seen:
+                    continue
+                seen.add(issue_url)
+                discovered.append(issue_url)
+        return discovered
 
     def cbpt_portal_ajax_action_from_onclick(self, onclick_value: str) -> Optional[PortalAjaxAction]:
         if self.site_family != "cbpt_cnki" or not self.site_host.endswith(".cbpt.cnki.net"):
@@ -1186,7 +1233,7 @@ class SiteCrawler:
                 )
                 continue
 
-            for discovered_url in self.extract_urls_from_html_fragment(html_text if isinstance(html_text, str) else ""):
+            for discovered_url in self.extract_urls_from_html_fragment(html_text if isinstance(html_text, str) else "", source_url=source_url):
                 found.append((discovered_url, f"{action.method}:html"))
         self.logger.debug(
             "CBPT portal ajax expansion end page_kind=%s source=%s discoveries=%s",
@@ -1310,10 +1357,6 @@ class SiteCrawler:
             return False
         if is_probably_unsafe_action_url(normalized):
             return False
-        if self.config.aggressive_same_site_crawl:
-            if self.is_ajcass and parts.fragment:
-                return self.ajcass_route_from_url(normalized).startswith("/")
-            return True
         if is_probably_non_navigational_endpoint(normalized):
             return False
         if self.site_family == "cbpt_cnki":
@@ -1337,6 +1380,10 @@ class SiteCrawler:
                 return False
         if self.is_ajcass and parts.path.lower().endswith("/waf_slider_verify.html"):
             return False
+        if self.config.aggressive_same_site_crawl:
+            if self.is_ajcass and parts.fragment:
+                return self.ajcass_route_from_url(normalized).startswith("/")
+            return True
         if self.is_ajcass and parts.fragment:
             return self.ajcass_route_from_url(normalized).startswith("/")
         return True
@@ -1789,6 +1836,34 @@ class SiteCrawler:
         except Exception as exc:
             raise ValueError("Browser fetch returned non-JSON response status={0} url={1}".format(payload.get("status"), url)) from exc
 
+    async def fetch_text_via_browser(self, page: Page, url: str, method: str = "GET", data: Optional[Dict[str, Any]] = None) -> str:
+        payload = await page.evaluate(
+            """async ({ url, method, data }) => {
+                const options = { method, credentials: 'include' };
+                if (method !== 'GET' && data) {
+                    const params = new URLSearchParams();
+                    for (const [key, value] of Object.entries(data)) {
+                        if (value === null || value === undefined) continue;
+                        if (Array.isArray(value)) {
+                            for (const item of value) {
+                                if (item === null || item === undefined) continue;
+                                params.append(key, String(item));
+                            }
+                        } else {
+                            params.append(key, String(value));
+                        }
+                    }
+                    options.body = params.toString();
+                    options.headers = { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' };
+                }
+                const response = await fetch(url, options);
+                const text = await response.text();
+                return { ok: response.ok, status: response.status, text };
+            }""",
+            {"url": url, "method": method, "data": data or {}},
+        )
+        return str(payload.get("text") or "")
+
     async def request_json(self, session: CrawlerSession, page: Page, method: str, url: str, data: Optional[Dict[str, Any]] = None) -> Any:
         await self.api_expansion_semaphore.acquire()
         try:
@@ -1816,6 +1891,112 @@ class SiteCrawler:
             return await self.fetch_json_via_browser(page, url, method=method, data=data)
         finally:
             self.api_expansion_semaphore.release()
+
+    async def request_text(self, session: CrawlerSession, page: Page, method: str, url: str, data: Optional[Dict[str, Any]] = None) -> str:
+        await self.api_expansion_semaphore.acquire()
+        try:
+            if session.api_mode == "request" and session.api_context is not None:
+                try:
+                    if method == "GET":
+                        response = await session.api_context.get(url)
+                    else:
+                        response = await session.api_context.post(url, data=data or {})
+                    payload = await response.text()
+                    self.mark_session_success(session)
+                    return str(payload or "")
+                except Exception as exc:
+                    if self.is_session_transport_error(exc):
+                        recovered = await self.rebuild_session(session, "api-request-text:{0}".format(url))
+                        if recovered and session.api_mode == "request" and session.api_context is not None:
+                            if method == "GET":
+                                response = await session.api_context.get(url)
+                            else:
+                                response = await session.api_context.post(url, data=data or {})
+                            payload = await response.text()
+                            self.mark_session_success(session)
+                            return str(payload or "")
+                    raise
+            return await self.fetch_text_via_browser(page, url, method=method, data=data)
+        finally:
+            self.api_expansion_semaphore.release()
+
+    def should_expand_cbpt_classic_http_url(self, url: str) -> bool:
+        if self.site_family != "cbpt_cnki" or self.is_cbpt_portal_url(url):
+            return False
+        if not self.is_same_site(url):
+            return False
+        if self.page_kind(url) != "cbpt_list":
+            return False
+        parts = urlsplit(self.normalize_url(url) or url)
+        lowered_path = parts.path.lower()
+        params = cbpt_query_params(url)
+        if lowered_path.endswith("/wktextcontent.aspx"):
+            return any(params.get(key) for key in ("colType", "tp", "yt", "st", "navigationContentID"))
+        if lowered_path.endswith("/wklist.aspx"):
+            return True
+        return False
+
+    async def discover_cbpt_classic_http_urls(
+        self,
+        session: CrawlerSession,
+        page: Page,
+        source_url: str,
+        page_kind: str,
+        discoveries: List[Tuple[str, str]],
+    ) -> List[Tuple[str, str]]:
+        if self.site_family != "cbpt_cnki" or self.is_cbpt_portal_url(source_url):
+            return []
+        if page_kind != "cbpt_list":
+            return []
+
+        queue: Deque[str] = deque()
+        queued: Set[str] = set()
+        seen_fetches: Set[str] = {source_url}
+        limit = self.config.max_api_pages_per_series if self.config.max_api_pages_per_series > 0 else 256
+
+        for raw_url, _ in discoveries:
+            normalized = self.normalize_url(raw_url, base_url=source_url)
+            if not normalized or normalized in queued:
+                continue
+            if not self.should_expand_cbpt_classic_http_url(normalized):
+                continue
+            queue.append(normalized)
+            queued.add(normalized)
+
+        if not queue:
+            return []
+
+        found: List[Tuple[str, str]] = []
+        fetch_count = 0
+        while queue and fetch_count < limit:
+            target_url = queue.popleft()
+            if target_url in seen_fetches:
+                continue
+            seen_fetches.add(target_url)
+            try:
+                html_text = await self.request_text(session, page, "GET", target_url)
+            except Exception as exc:
+                self.logger.warning(
+                    "CBPT classic http expansion failed source=%s target=%s error=%s",
+                    source_url,
+                    target_url,
+                    exc,
+                )
+                continue
+            if not html_text or "showValidateCode.aspx" in html_text:
+                continue
+            fetch_count += 1
+            found.append((target_url, "cbpt-classic:http"))
+            extracted_urls = self.extract_urls_from_html_fragment(html_text, source_url=target_url)
+            for discovered_url in extracted_urls:
+                found.append((discovered_url, "cbpt-classic:http:html"))
+                normalized = self.normalize_url(discovered_url, base_url=target_url)
+                if not normalized or normalized in queued or normalized in seen_fetches:
+                    continue
+                if self.should_expand_cbpt_classic_http_url(normalized):
+                    queue.append(normalized)
+                    queued.add(normalized)
+        return found
 
     async def collect_response_task_results(
         self,
@@ -1917,10 +2098,10 @@ class SiteCrawler:
             if attr == "onclick":
                 urls.extend(self.extract_cbpt_portal_urls_from_onclick(value))
             if attr in {"href", "src", "action", "data-href", "data-url", "data-src", "poster", "location"} and self.is_urlish_attribute_value(value):
-                urls.append(value)
+                urls.append(self.normalize_url(value, base_url=page.url) or value)
         html = payload.get("html")
         if isinstance(html, str):
-            urls.extend(self.extract_urls_from_html_fragment(html))
+            urls.extend(self.extract_urls_from_html_fragment(html, source_url=page.url))
         return urls
 
     async def probe_click_texts(self, page: Page, source_url: str, depth: int, labels: list[str]) -> list[tuple[str, str]]:
@@ -1948,7 +2129,7 @@ class SiteCrawler:
                 pass
             await locator.click(timeout=3000)
             await page.wait_for_timeout(1200)
-            await self.settle_page(page)
+            await self.settle_page(page, "heavy", self.page_kind(page.url))
         except Exception:
             for task in (popup_task, download_task):
                 if not task.done():
@@ -1957,7 +2138,7 @@ class SiteCrawler:
             if page.url != source_url:
                 try:
                     await page.goto(source_url, wait_until="domcontentloaded")
-                    await self.settle_page(page)
+                    await self.settle_page(page, "heavy", self.page_kind(page.url))
                 except Exception:
                     pass
             return found
@@ -1996,7 +2177,7 @@ class SiteCrawler:
         if page.url != source_url:
             try:
                 await page.goto(source_url, wait_until="domcontentloaded")
-                await self.settle_page(page)
+                await self.settle_page(page, "heavy", self.page_kind(page.url))
             except Exception:
                 pass
         return found
@@ -2971,6 +3152,16 @@ class SiteCrawler:
                         )
                 elif self.is_cbpt_portal_url(page.url):
                     discoveries.extend(await self.discover_cbpt_portal_ajax_urls(page, page.url, visit.page_kind))
+                elif self.site_family == "cbpt_cnki":
+                    discoveries.extend(
+                        await self.discover_cbpt_classic_http_urls(
+                            session=session,
+                            page=page,
+                            source_url=page.url,
+                            page_kind=visit.page_kind,
+                            discoveries=discoveries,
+                        )
+                    )
                 discoveries.extend(await self.run_generic_interactions(page, page.url, visit.page_kind))
 
                 if response_tasks:
