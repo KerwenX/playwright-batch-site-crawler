@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
+import os
+import sys
 import time
 import traceback
 from collections import deque
@@ -14,6 +17,8 @@ from .constants import *
 from .models import *
 from .site import SiteCrawler
 from .utils import *
+
+CHILD_WORKER_ENV = "CRAWLER_CHILD_WORKER"
 
 class BatchRunner:
     def __init__(self, config_path: Union[str, Path] = DEFAULT_CONFIG_PATH) -> None:
@@ -29,12 +34,13 @@ class BatchRunner:
             log_file=(self.output_root / "batch.log") if self.batch_config.log_to_file else None,
         )
         self.logger.info(
-            "Batch runner initialized config=%s output_root=%s log_level=%s chromium_executable_path=%s aggressive_same_site_crawl=%s max_site_concurrency=%s playwright_driver_pool_size=%s write_full_outputs_on_checkpoint=%s",
+            "Batch runner initialized config=%s output_root=%s log_level=%s chromium_executable_path=%s aggressive_same_site_crawl=%s worker_process_count=%s max_site_concurrency=%s playwright_driver_pool_size=%s write_full_outputs_on_checkpoint=%s",
             self.config_path,
             self.output_root,
             self.batch_config.log_level,
             self.batch_config.chromium_executable_path or "<playwright-default>",
             self.batch_config.aggressive_same_site_crawl,
+            self.batch_config.worker_process_count,
             self.batch_config.max_site_concurrency,
             self.batch_config.playwright_driver_pool_size,
             self.batch_config.write_full_outputs_on_checkpoint,
@@ -101,6 +107,133 @@ class BatchRunner:
             )
         self.logger.info("Built site configs count=%s input_path=%s", len(site_configs), input_path)
         return site_configs
+
+    def is_child_worker_mode(self) -> bool:
+        return os.environ.get(CHILD_WORKER_ENV, "").strip() == "1"
+
+    def worker_runtime_root(self) -> Path:
+        runtime_root = self.output_root / "_batch_runtime"
+        runtime_root.mkdir(parents=True, exist_ok=True)
+        return runtime_root
+
+    def build_worker_site_shards(self, site_configs: list[SiteConfig], worker_count: int) -> list[list[SiteConfig]]:
+        shards: list[list[SiteConfig]] = [[] for _ in range(worker_count)]
+        for index, site_config in enumerate(site_configs):
+            shards[index % worker_count].append(site_config)
+        return shards
+
+    def build_child_worker_payload(self, site_keys: list[str], worker_count: int) -> dict[str, Any]:
+        payload = json.loads(self.config_path.read_text(encoding="utf-8-sig"))
+        payload["worker_process_count"] = 1
+        payload["output_root"] = str(self.output_root.resolve())
+        payload["max_site_concurrency"] = max(1, math.ceil(self.batch_config.max_site_concurrency / max(1, worker_count)))
+        payload["playwright_driver_pool_size"] = max(1, math.ceil(self.batch_config.playwright_driver_pool_size / max(1, worker_count)))
+        payload["input_urls_file"] = "worker_input_urls.txt"
+        return payload
+
+    def build_child_worker_files(self, worker_index: int, shard: list[SiteConfig], worker_count: int) -> tuple[Path, Path]:
+        worker_dir = self.worker_runtime_root() / "workers" / "worker_{0:02d}".format(worker_index + 1)
+        worker_dir.mkdir(parents=True, exist_ok=True)
+        config_path = worker_dir / "config.worker.json"
+        input_path = worker_dir / "worker_input_urls.txt"
+        seed_lines: list[str] = []
+        for site_config in shard:
+            seed_lines.extend(site_config.seed_urls)
+        atomic_write_text(input_path, "\n".join(seed_lines) + ("\n" if seed_lines else ""))
+        payload = self.build_child_worker_payload([site.site_key for site in shard], worker_count)
+        atomic_write_text(config_path, json.dumps(payload, ensure_ascii=False, indent=2))
+        return config_path, input_path
+
+    async def stream_subprocess_output(self, stream: Optional[asyncio.StreamReader], log_path: Path, prefix: str) -> None:
+        if stream is None:
+            return
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("ab") as handle:
+            while True:
+                line = await stream.readline()
+                if not line:
+                    break
+                handle.write(line)
+                try:
+                    text = line.decode("utf-8", errors="replace").rstrip()
+                except Exception:
+                    text = repr(line)
+                if text:
+                    self.logger.info("%s %s", prefix, text)
+
+    async def run_worker_subprocess(self, worker_index: int, shard: list[SiteConfig], worker_count: int) -> dict[str, Any]:
+        config_path, input_path = self.build_child_worker_files(worker_index, shard, worker_count)
+        worker_log_path = config_path.parent / "worker.log"
+        env = os.environ.copy()
+        env[CHILD_WORKER_ENV] = "1"
+        command = [
+            sys.executable,
+            "-c",
+            "from crawler_core.cli import main; raise SystemExit(main(r'''{0}'''))".format(str(config_path)),
+        ]
+        self.logger.info(
+            "Starting worker subprocess worker=%s sites=%s config=%s input=%s max_site_concurrency=%s driver_pool=%s",
+            worker_index + 1,
+            len(shard),
+            config_path,
+            input_path,
+            math.ceil(self.batch_config.max_site_concurrency / max(1, worker_count)),
+            math.ceil(self.batch_config.playwright_driver_pool_size / max(1, worker_count)),
+        )
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            cwd=str(self.config_path.parent),
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        await self.stream_subprocess_output(process.stdout, worker_log_path, "[worker-{0:02d}]".format(worker_index + 1))
+        return_code = await process.wait()
+        self.logger.info(
+            "Worker subprocess finished worker=%s return_code=%s log=%s",
+            worker_index + 1,
+            return_code,
+            worker_log_path,
+        )
+        return {
+            "worker_index": worker_index + 1,
+            "return_code": return_code,
+            "site_count": len(shard),
+            "site_keys": [site.site_key for site in shard],
+            "config_path": str(config_path),
+            "log_path": str(worker_log_path),
+        }
+
+    async def run_multiprocess(self, site_configs: list[SiteConfig]) -> dict[str, Any]:
+        worker_count = max(1, min(self.batch_config.worker_process_count, len(site_configs)))
+        if worker_count <= 1 or self.is_child_worker_mode():
+            return await self.run_single_process(site_configs)
+        shards = [shard for shard in self.build_worker_site_shards(site_configs, worker_count) if shard]
+        self.logger.info(
+            "Multiprocess crawl start workers=%s total_sites=%s output_root=%s",
+            len(shards),
+            len(site_configs),
+            self.output_root,
+        )
+        worker_tasks = [
+            asyncio.create_task(self.run_worker_subprocess(worker_index, shard, len(shards)))
+            for worker_index, shard in enumerate(shards)
+        ]
+        worker_results = await asyncio.gather(*worker_tasks)
+        batch_summary = self._write_global_outputs([])
+        batch_summary["worker_process_count"] = len(shards)
+        batch_summary["workers"] = worker_results
+        atomic_write_text(self.output_root / "batch_summary.json", json.dumps(batch_summary, ensure_ascii=False, indent=2))
+        failed_workers = [item for item in worker_results if int(item.get("return_code", 1)) != 0]
+        if failed_workers:
+            self.logger.warning(
+                "Multiprocess crawl completed with worker failures failed=%s total=%s",
+                len(failed_workers),
+                len(worker_results),
+            )
+        else:
+            self.logger.info("Multiprocess crawl completed workers=%s", len(worker_results))
+        return batch_summary
 
     def _load_completed_site_summary_if_skippable(self, site_config: SiteConfig) -> Optional[dict[str, Any]]:
         checkpoint_path = site_config.output_dir / "checkpoint.json"
@@ -181,15 +314,22 @@ class BatchRunner:
             self.logger.exception("Site crawl failed site=%s output_dir=%s", site_config.site_key, site_config.output_dir)
             return error_summary
 
-    async def run(self) -> dict[str, Any]:
-        site_configs = self.build_site_configs()
+    async def run_single_process(
+        self,
+        site_configs: Optional[list[SiteConfig]] = None,
+        write_global_outputs: bool = True,
+    ) -> dict[str, Any]:
+        if site_configs is None:
+            site_configs = self.build_site_configs()
         batch_results: list[dict[str, Any]] = []
         self.logger.info(
-            "Batch run start sites=%s skip_completed=%s input_urls_file=%s max_site_concurrency=%s",
+            "Single-process batch run start sites=%s skip_completed=%s input_urls_file=%s max_site_concurrency=%s child_worker=%s write_global_outputs=%s",
             len(site_configs),
             self.batch_config.skip_completed_sites,
             self.batch_config.input_urls_file,
             self.batch_config.max_site_concurrency,
+            self.is_child_worker_mode(),
+            write_global_outputs,
         )
         runnable_sites: list[SiteConfig] = []
         for site_config in site_configs:
@@ -256,14 +396,40 @@ class BatchRunner:
             for shared_playwright in shared_playwright_pool:
                 await shared_playwright.stop()
 
-        batch_summary = self._write_global_outputs(batch_results)
+        if write_global_outputs:
+            batch_summary = self._write_global_outputs(batch_results)
+        else:
+            batch_summary = {
+                "generated_at": int(time.time()),
+                "config_path": str(self.config_path),
+                "sites_total": len(site_configs),
+                "sites_completed": sum(1 for item in batch_results if item.get("completed")),
+                "sites": [
+                    {
+                        "site_key": item.get("site_key", ""),
+                        "site_host": item.get("site_host", ""),
+                        "completed": item.get("completed", False),
+                    }
+                    for item in batch_results
+                ],
+            }
+            atomic_write_text(self.output_root / "batch_summary.child.json", json.dumps(batch_summary, ensure_ascii=False, indent=2))
         self.logger.info(
-            "Batch run finished completed_sites=%s total_sites=%s summary=%s",
+            "Single-process batch run finished completed_sites=%s total_sites=%s summary=%s",
             batch_summary.get("sites_completed", 0),
             batch_summary.get("sites_total", 0),
-            self.output_root / "batch_summary.json",
+            (self.output_root / "batch_summary.json") if write_global_outputs else (self.output_root / "batch_summary.child.json"),
         )
         return batch_summary
+
+    async def run(self) -> dict[str, Any]:
+        site_configs = self.build_site_configs()
+        if self.batch_config.worker_process_count > 1 and not self.is_child_worker_mode():
+            return await self.run_multiprocess(site_configs)
+        return await self.run_single_process(
+            site_configs,
+            write_global_outputs=not self.is_child_worker_mode(),
+        )
 
     def _write_global_outputs(self, batch_results: list[dict[str, Any]]) -> dict[str, Any]:
         all_links_lines = ["site_folder\tsite_host\turl\tsame_site\tqueueable\tpage_kind\tfirst_depth"]
