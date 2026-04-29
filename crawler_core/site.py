@@ -193,6 +193,62 @@ class SiteCrawler:
         )
         return any(marker in text for marker in markers)
 
+    def is_context_closed_error(self, exc: Exception) -> bool:
+        """Check if exception indicates browser context is closed (not just page/browser)."""
+        text = "{0}: {1}".format(type(exc).__name__, exc).lower()
+        markers = (
+            "target page, context or browser has been closed",
+            "browser context has been closed",
+            "context has been closed",
+        )
+        return any(marker in text for marker in markers)
+
+    async def safe_new_page(self, session: CrawlerSession, item_url: str, page_attempt: int) -> Optional[Page]:
+        """
+        Safely create a new page with automatic context recovery.
+        Handles TargetClosedError by attempting session rebuild.
+
+        Returns:
+            Page object if successful, None if context is unavailable after recovery attempts.
+        """
+        if session.context is None:
+            recovered = await self.rebuild_session(session, "missing-context:{0}".format(item_url))
+            if not recovered:
+                return None
+
+        try:
+            return await session.context.new_page()
+        except Exception as exc:
+            if self.is_context_closed_error(exc):
+                self.logger.warning(
+                    "Context closed detected during new_page site=%s session=%s proxy=%s url=%s attempt=%s, force rebuilding...",
+                    self.config.site_key,
+                    session.index,
+                    session.proxy_label,
+                    item_url,
+                    page_attempt,
+                )
+                # Force rebuild since context is already closed - no point waiting for other pages
+                recovered = await self.rebuild_session(
+                    session,
+                    "context-closed:{0}:attempt:{1}".format(item_url, page_attempt),
+                    force=True,
+                )
+                if recovered:
+                    try:
+                        return await session.context.new_page()
+                    except Exception as retry_exc:
+                        self.logger.error(
+                            "new_page failed after context rebuild site=%s session=%s url=%s error=%s",
+                            self.config.site_key,
+                            session.index,
+                            item_url,
+                            retry_exc,
+                        )
+                        return None
+                return None
+            raise
+
     def session_on_cooldown(self, session: CrawlerSession) -> bool:
         return session.unhealthy_until > time.time()
 
@@ -259,9 +315,9 @@ class SiteCrawler:
         session.draining = True
         session.pending_rebuild_reason = reason
 
-    async def rebuild_session(self, session: CrawlerSession, reason: str) -> bool:
+    async def rebuild_session(self, session: CrawlerSession, reason: str, force: bool = False) -> bool:
         async with session.rebuild_lock:
-            if session.active_pages > 1:
+            if session.active_pages > 1 and not force:
                 self.mark_session_draining(session, reason)
                 return False
             await self.dispose_session_resources(session)
@@ -3061,11 +3117,9 @@ class SiteCrawler:
             )
 
             try:
-                if session.context is None:
-                    recovered = await self.rebuild_session(session, "missing-context:{0}".format(item.url))
-                    if not recovered:
-                        raise RuntimeError("Session context unavailable for {0}".format(item.url))
-                page = await session.context.new_page()
+                page = await self.safe_new_page(session, item.url, page_attempt)
+                if page is None:
+                    raise RuntimeError("Session context unavailable for {0}".format(item.url))
                 if self.config.enable_request_blocking:
                     await page.route("**/*", self.handle_route)
 
