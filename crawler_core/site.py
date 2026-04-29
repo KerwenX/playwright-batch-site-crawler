@@ -2241,7 +2241,17 @@ class SiteCrawler:
     async def probe_selector_clicks(self, page: Page, source_url: str, selector: str, method_prefix: str, limit: int) -> list[tuple[str, str]]:
         found: list[tuple[str, str]] = []
         locator = page.locator(selector)
-        count = await locator.count()
+        try:
+            count = await locator.count()
+        except Exception as exc:
+            if self.is_session_transport_error(exc):
+                self.logger.warning(
+                    "probe_selector_clicks: context closed during count, returning found so far site=%s selector=%s",
+                    self.config.site_key,
+                    selector,
+                )
+                return found
+            raise
         for index in range(min(count, limit)):
             current = locator.nth(index)
             try:
@@ -2256,7 +2266,18 @@ class SiteCrawler:
                 pass
             if not label:
                 label = f"{selector}[{index}]"
-            found.extend(await self.click_probe(page, current, source_url, label, method_prefix))
+            try:
+                found.extend(await self.click_probe(page, current, source_url, label, method_prefix))
+            except Exception as exc:
+                if self.is_session_transport_error(exc):
+                    self.logger.warning(
+                        "probe_selector_clicks: context closed during click probe, returning found so far site=%s selector=%s index=%s",
+                        self.config.site_key,
+                        selector,
+                        index,
+                    )
+                    return found
+                raise
         return found
 
     async def run_generic_interactions(self, page: Page, source_url: str, page_kind: str) -> list[tuple[str, str]]:
